@@ -122,8 +122,12 @@ def _five_layer_args(profile: _Profile, stage: str) -> ScriptArgs:
     rollout_only = stage == "rollout"
     extra_args = "--rollout-seed 1234 --seed 1234 "
     if rollout_only:
+        # nsa (GLM-5.2 DSA) is not in SGLang's deterministic attention-backend allowlist,
+        # so deterministic inference is dropped for the rollout capture. Eager mode
+        # (--sglang-disable-cuda-graph) is kept for a clean capture; the trainer/grpo
+        # stages only assert a valid capture with finite logprobs, not determinism.
         extra_args += (
-            "--ci-test --sglang-enable-deterministic-inference --sglang-disable-cuda-graph "
+            "--ci-test --sglang-disable-cuda-graph "
             f"--save-debug-rollout-data {shlex.quote(_replay_path(profile))} "
         )
     elif stage == "trainer":

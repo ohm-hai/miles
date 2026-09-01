@@ -50,5 +50,6 @@ def model_args(n_moe_layers: int = 75) -> str:
         "--rope-type rope "
         "--rotary-base 8000000 "
         "--rotary-scaling-factor 1 "
+        "--no-rope-fusion "
         "--enable-experimental "
     )
