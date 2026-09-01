@@ -1,15 +1,31 @@
 ### 0
+python <REPO_ROOT>/tools/validate_grpo_dataset.py /root/datasets/dapo-math-17k/dapo-math-17k.jsonl
+  --profile dapo-math-17k
+  --tokenizer /root/local_data/GLM-5.2_5layer
+  --max-prompt-tokens 1024
+  --expected-min-prompt-tokens 73
+  --expected-max-prompt-tokens 1521
+  --expected-prompts-over-token-limit 7
+
+### 1
+python <REPO_ROOT>/scripts/amd/run_glm5_2_744b_a40b.py validate-artifacts-internal
+  --root /root/local_data
+  --model-name GLM-5.2_5layer
+  --model-org Pinaster
+  --model-revision 1c749139f70e158e4420ba67f342bef1de2e650d
+
+### 2
 pkill -9 sglang; sleep 3; ray stop
   --force; pkill -9 ray; pkill -9 miles; sleep 3; pkill -9 ray; pkill -9 miles; pkill -9 redis; true; 
 
-### 1
+### 3
 export PYTHONUNBUFFERED=1 && ray start
   --head
   --node-ip-address 127.0.0.1
   --num-gpus 4
   --disable-usage-stats
 
-### 2
+### 4
 export no_proxy=127.0.0.1 && export PYTHONUNBUFFERED=1 && ray job submit
   --address="http://127.0.0.1:8265"
   --runtime-env-json='{"env_vars": {"PYTHONUNBUFFERED": "1", "CUDA_DEVICE_MAX_CONNECTIONS": "1", "NCCL_NVLS_ENABLE": "0", "no_proxy": "127.0.0.1,127.0.0.1", "MASTER_ADDR": "127.0.0.1", "MILES_HARDWARE_PLATFORM": "rocm", "SGLANG_NSA_FORCE_MLA": "1", "INDEXER_ROPE_NEOX_STYLE": "0", "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES": "1", "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1", "PYTHONPATH": "<REPO_ROOT>:/root/Megatron-LM:/frozen/pythonpath"}}'
@@ -50,7 +66,9 @@ export no_proxy=127.0.0.1 && export PYTHONUNBUFFERED=1 && ray job submit
   --kv-channels 192
   --qk-pos-emb-head-dim 64
   --vocab-size 154880
+  --rope-type rope
   --rotary-base 8000000
+  --rotary-scaling-factor 1
   --enable-experimental
   --hf-checkpoint /root/local_data/GLM-5.2_5layer
   --ref-load /root/local_data/GLM-5.2_5layer_torch_dist
@@ -67,6 +85,7 @@ export no_proxy=127.0.0.1 && export PYTHONUNBUFFERED=1 && ray job submit
   --num-rollout 3000
   --rollout-batch-size 8
   --n-samples-per-prompt 8
+  --rollout-max-prompt-len 1024
   --rollout-max-response-len 100
   --rollout-temperature 1
   --global-batch-size 64
@@ -139,6 +158,3 @@ export no_proxy=127.0.0.1 && export PYTHONUNBUFFERED=1 && ray job submit
   --rollout-health-check-timeout 300
   --rematerialize-param-from-master-weight
   --freeze-indexer
-  --use-rollout-routing-replay
-  --moe-router-freeze-gate
-  --freeze-e-score-correction-bias   

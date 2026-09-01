@@ -1,7 +1,22 @@
 ### 0
+python <REPO_ROOT>/scripts/amd/run_glm5_2_744b_a40b.py validate-artifacts-internal
+  --root <SANDBOX>/models
+  --model-name GLM-5.2_5layer
+  --model-org Pinaster
+  --model-revision 1c749139f70e158e4420ba67f342bef1de2e650d
+  --require-source
+
+### 1
 mkdir -p /root/local_data/GLM-5.2_5layer_torch_dist && rsync -a
   --info=progress2 <SANDBOX>/models/GLM-5.2_5layer_torch_dist/ /root/local_data/GLM-5.2_5layer_torch_dist
 
-### 1
+### 2
 mkdir -p /root/local_data/GLM-5.2_5layer && rsync -a
   --info=progress2 <SANDBOX>/models/GLM-5.2_5layer/ /root/local_data/GLM-5.2_5layer
+
+### 3
+python <REPO_ROOT>/scripts/amd/run_glm5_2_744b_a40b.py validate-artifacts-internal
+  --root /root/local_data
+  --model-name GLM-5.2_5layer
+  --model-org Pinaster
+  --model-revision 1c749139f70e158e4420ba67f342bef1de2e650d

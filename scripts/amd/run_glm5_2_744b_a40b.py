@@ -7,97 +7,71 @@ has full-model GB300 evidence, but has not yet been qualified on AMD; follow the
 AMD bring-up runbook before treating it as supported.
 
 Every full-profile command requires an already joined, dedicated Ray cluster.
-Export ``MILES_SCRIPT_EXTERNAL_RAY=1`` and an explicit ``RAY_ADDRESS`` before
-conversion, copying, or training so the launcher validates rather than replaces
-the 8-node allocation.
+Export ``MILES_SCRIPT_EXTERNAL_RAY=1``, an explicit ``RAY_ADDRESS``, and a
+non-loopback ``MASTER_ADDR`` on one of the Ray nodes before conversion, copying,
+or training so the launcher validates rather than replaces the 8-node allocation.
 
 Args:
   --model-name: ``GLM-5.2_5layer`` (4-GPU smoke) or ``GLM-5.2`` (64-GPU bring-up).
   --model-revision: Immutable Hugging Face commit; defaults to the audited checkpoint revision.
   --data-revision: Immutable dapo-math-17k commit used by the acceptance recipe.
   --hardware: ``MI350X`` or ``MI355X``; ``auto`` detects the local device.
+  --single-node-topology: Keep the five-layer H16 PoC or select the experimental H8 shape.
+  --rollout-only: Run load/prefill/decode with lightweight control actors but no trainer model/optimizer.
+  --full-model-rollout-only: Select the guarded full-checkpoint 1-node x 8-GPU rollout gate.
+  --rollout-probe-mode: Use the default graph path or an eager full-model rollout probe.
+  --rollout-probe-capture: Save full-model probe samples to this rollout-ID path template.
+  --allow-unvalidated-features: Required for experimental H8, full single-node, FP8, or DeepEP paths.
   --fp8-rollout: Quantize only the SGLang weights to block FP8. Trainer weights stay BF16.
   --enable-optimizer-offload: Move optimizer state to host memory if GPU memory is tight.
   --offload-train-target: Park the colocated trainer in host RAM (``cpu``) or node-local NVMe (``disk``).
   --model-dir: Shared model/checkpoint source. ``--model-local-dir`` is node-local storage.
 
 Examples:
+  python scripts/amd/run_glm5_2_744b_a40b.py download --hardware MI355X \
+      --model-name GLM-5.2 --num-nodes 8 --num-gpus-per-node 8
+
   python scripts/amd/run_glm5_2_744b_a40b.py full-train \
       --hardware MI355X --model-name GLM-5.2_5layer --num-gpus-per-node 4
 
-  MILES_SCRIPT_EXTERNAL_RAY=1 RAY_ADDRESS=http://10.0.0.1:8265 \
+  python scripts/amd/run_glm5_2_744b_a40b.py full-train --hardware MI355X \
+      --model-name GLM-5.2 --num-nodes 1 --num-gpus-per-node 8 \
+      --full-model-rollout-only --allow-unvalidated-features
+
+  MILES_SCRIPT_EXTERNAL_RAY=1 RAY_ADDRESS=http://10.0.0.1:8265 MASTER_ADDR=10.0.0.1 \
       python scripts/amd/run_glm5_2_744b_a40b.py train \
       --hardware MI355X --model-name GLM-5.2 --num-nodes 8 \
-      --num-gpus-per-node 8 --fp8-rollout
+      --num-gpus-per-node 8 --fp8-rollout --allow-unvalidated-features
 """
 
 import json
 import os
-import re
 import shlex
-import socket
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Literal
-from urllib.parse import urlparse
 
-import ray
 import typer
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 import miles.utils.external_utils.command_utils as U
+from scripts.amd import _glm5_2_amd_cluster as _cluster
+from scripts.amd import _glm5_2_amd_artifacts as _artifacts
+from scripts.amd import _glm5_2_amd_profiles as _profiles
+from scripts.amd import _glm5_2_amd_spec as _spec
+from scripts.amd import _glm5_2_grpo_dataset as _dataset
 
 app = typer.Typer()
 
 _MODEL_NAMES = Literal["GLM-5.2", "GLM-5.2_5layer"]
 _FULL_PIPELINE_LAYERS = (18, 20, 20, 20)
-_MODEL_REVISIONS = {
-    "GLM-5.2": "b4734de4facf877f85769a911abafc5283eab3d9",
-    "GLM-5.2_5layer": "1c749139f70e158e4420ba67f342bef1de2e650d",
-}
-_DATA_REVISION = "2e65612930298bde4c5d58fd97b3f23a483aaff9"
-_EXPECTED_FULL_NUM_NODES = 8
-_EXPECTED_GPUS_PER_NODE = 8
-_PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+_MODEL_REVISIONS = _spec.MODEL_REVISIONS
+_DATA_REVISION = _spec.DATA_REVISION
 _ARTIFACT_MANIFEST_NAME = ".miles-artifact.json"
-_CHECKPOINT_INDEX_LAYOUTS = {
-    # (number of weight entries, number of shard files, tensor payload bytes)
-    "GLM-5.2": (59585, 282, 1506659919872),
-    "GLM-5.2_5layer": (1618, 14, 45683868160),
-}
-_CRITICAL_CONFIG_VALUES = {
-    "architectures": ["GlmMoeDsaForCausalLM"],
-    "dtype": "bfloat16",
-    "first_k_dense_replace": 3,
-    "head_dim": 192,
-    "hidden_size": 6144,
-    "index_head_dim": 128,
-    "index_n_heads": 32,
-    "index_skip_topk_offset": 3,
-    "index_topk": 2048,
-    "index_topk_freq": 4,
-    "indexer_rope_interleave": True,
-    "intermediate_size": 12288,
-    "kv_lora_rank": 512,
-    "model_type": "glm_moe_dsa",
-    "moe_intermediate_size": 2048,
-    "n_routed_experts": 256,
-    "n_shared_experts": 1,
-    "num_attention_heads": 64,
-    "num_experts_per_tok": 8,
-    "num_nextn_predict_layers": 1,
-    "q_lora_rank": 2048,
-    "qk_head_dim": 256,
-    "qk_nope_head_dim": 192,
-    "qk_rope_head_dim": 64,
-    "rope_parameters": {"rope_theta": 8000000, "rope_type": "default"},
-    "routed_scaling_factor": 2.5,
-    "scoring_func": "sigmoid",
-    "topk_method": "noaux_tc",
-    "v_head_dim": 256,
-    "vocab_size": 154880,
-}
+_CHECKPOINT_INDEX_LAYOUTS = _spec.CHECKPOINT_INDEX_LAYOUTS
+_CRITICAL_CONFIG_VALUES = _spec.CRITICAL_CONFIG_VALUES
+_RUNTIME_HF_ASSETS = _spec.RUNTIME_HF_ASSETS
+_SOURCE_CONFIG_ASSETS = _spec.SOURCE_CONFIG_ASSETS
+_SOURCE_INDEX_ASSETS = _spec.SOURCE_INDEX_ASSETS
 
 
 @dataclass
@@ -111,6 +85,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     megatron_model_type: str = field(init=False)
     hardware: Literal["auto", "MI350X", "MI355X"] = "auto"
     num_gpus_per_node: int | None = None
+    single_node_topology: _profiles.SingleNodeTopology = "poc-h16"
+    full_model_rollout_only: bool = False
+    _topology: _profiles.Topology = field(init=False, repr=False)
 
     fp8_rollout: bool = False
     use_deepep: bool = False
@@ -124,9 +101,12 @@ class ScriptArgs(U.ExecuteTrainConfig):
     enable_indexer_replay: bool = False
     enable_mtp: bool = False
     allow_unvalidated_features: bool = False
+    rollout_only: bool = False
+    rollout_probe_mode: Literal["graph", "eager"] = "graph"
+    rollout_probe_capture: str | None = None
     skip_saving: bool = False
 
-    num_rollout: int = 3000
+    num_rollout: int | None = None
     rollout_max_prompt_len: int | None = None
     rollout_max_response_len: int | None = None
     max_tokens_per_gpu: int | None = None
@@ -143,10 +123,14 @@ class ScriptArgs(U.ExecuteTrainConfig):
     def __post_init__(self):
         self.hardware = U.resolve_hardware(self)
         pruned = _is_pruned(self)
+        self._topology = _profiles.resolve(
+            model_name=self.model_name,
+            single_node_topology=self.single_node_topology,
+            full_model_rollout_only=self.full_model_rollout_only,
+        )
+        self.rollout_only = self.rollout_only or self._topology.rollout_only
         if self.num_gpus_per_node is None:
-            # Four GPUs is the only AMD-validated five-layer shape. The full
-            # profile uses every GPU in an eight-GPU MI35x node.
-            self.num_gpus_per_node = 4 if pruned else U.NUM_GPUS_OF_HARDWARE[self.hardware]
+            self.num_gpus_per_node = self._topology.num_gpus_per_node
 
         if self.model_name == "GLM-5.2":
             self.model_org = self.model_org or "zai-org"
@@ -158,8 +142,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
         if pruned:
             self.mode = "debug_minimal"
+        if self.num_rollout is None:
+            self.num_rollout = 1 if self.rollout_only else 3000
         if self.rollout_max_response_len is None:
-            self.rollout_max_response_len = 100 if pruned else 8192
+            self.rollout_max_response_len = 100 if pruned else (128 if self.rollout_only else 8192)
         if self.rollout_max_prompt_len is None:
             self.rollout_max_prompt_len = 1024 if pruned else 4096
         if self.max_tokens_per_gpu is None:
@@ -169,11 +155,13 @@ class ScriptArgs(U.ExecuteTrainConfig):
         if self.sglang_cuda_graph_max_bs is None:
             self.sglang_cuda_graph_max_bs = 32 if pruned else 1
         if self.sglang_max_running_requests is None:
-            self.sglang_max_running_requests = 256 if pruned else 32
+            self.sglang_max_running_requests = 256 if pruned else (8 if self._topology.rollout_only else 32)
         if self.enable_r3 is None:
-            self.enable_r3 = not pruned
+            self.enable_r3 = not pruned and not self.rollout_only
         if self.freeze_router is None:
             self.freeze_router = not pruned
+        if self.rollout_only:
+            self.skip_saving = True
 
         _validate_profile(self)
 
@@ -182,21 +170,29 @@ def _is_pruned(args: ScriptArgs) -> bool:
     return args.model_name == "GLM-5.2_5layer"
 
 
+def _is_rollout_only(args: ScriptArgs) -> bool:
+    return args.rollout_only
+
+
 def _validate_profile(args: ScriptArgs) -> None:
     shape = (args.num_nodes, args.num_gpus_per_node)
+    expected_shape = (args._topology.num_nodes, args._topology.num_gpus_per_node)
+    if shape != expected_shape:
+        raise NotImplementedError(
+            f"The AMD GLM-5.2 {args._topology.name} profile is defined only for "
+            f"{expected_shape[0]} node(s) x {expected_shape[1]} GPUs; got {shape[0]} x {shape[1]}."
+        )
     if _is_pruned(args):
-        if shape != (1, 4):
-            raise NotImplementedError(
-                "The AMD GLM-5.2 five-layer profile is qualified only on 1 node x 4 GPUs; "
-                f"got {shape[0]} x {shape[1]}."
-            )
         if args.enable_mtp:
             raise ValueError("GLM-5.2_5layer does not contain the checkpoint's MTP layer")
-    elif shape != (8, 8):
-        raise NotImplementedError(
-            "The AMD full GLM-5.2 bring-up profile is defined only for 8 nodes x 8 GPUs "
-            f"(64 total); got {shape[0]} x {shape[1]}."
-        )
+    assert args.num_rollout is not None and args.rollout_max_response_len is not None
+    _profiles.validate_rollout_contract(
+        args._topology,
+        rollout_only=args.rollout_only,
+        num_rollout=args.num_rollout,
+        max_response_len=args.rollout_max_response_len,
+        extra_args=args.extra_args,
+    )
 
     if not args.freeze_indexer:
         raise NotImplementedError(
@@ -214,6 +210,11 @@ def _validate_profile(args: ScriptArgs) -> None:
         "enable_indexer_replay": args.enable_indexer_replay,
         "enable_mtp": args.enable_mtp,
         "train_router": not _is_pruned(args) and not args.freeze_router,
+        **(
+            {args._topology.experimental_feature: True}
+            if args._topology.experimental_feature is not None
+            else {}
+        ),
     }
     enabled_experiments = [name for name, enabled in experimental_features.items() if enabled]
     if enabled_experiments and not args.allow_unvalidated_features:
@@ -228,7 +229,7 @@ def _validate_profile(args: ScriptArgs) -> None:
         raise ValueError("stream_optimizer_state_to_disk requires offload_train_target=disk")
     if args.stream_optimizer_state_to_disk and args.enable_optimizer_offload:
         raise ValueError("stream_optimizer_state_to_disk excludes enable_optimizer_offload")
-    if args.num_rollout <= 0:
+    if args.num_rollout is None or args.num_rollout <= 0:
         raise ValueError("num_rollout must be positive")
     if args.rollout_max_response_len is not None and args.rollout_max_response_len <= 0:
         raise ValueError("rollout_max_response_len must be positive")
@@ -253,6 +254,27 @@ def _validate_profile(args: ScriptArgs) -> None:
         raise ValueError("sglang_cuda_graph_max_bs must be positive")
     if args.sglang_max_running_requests is not None and args.sglang_max_running_requests <= 0:
         raise ValueError("sglang_max_running_requests must be positive")
+    no_train_offload = "--no-offload-train" in _profiles._validate_diagnostic_extra_args(
+        args.extra_args
+    )
+    if args.rollout_only and (
+        args.enable_optimizer_offload
+        or args.offload_train_target != "cpu"
+        or args.stream_optimizer_state_to_disk
+    ):
+        raise ValueError("Trainer offload options are invalid for a rollout-only profile")
+    if no_train_offload and (
+        args.offload_train_target != "cpu" or args.stream_optimizer_state_to_disk
+    ):
+        raise ValueError("--no-offload-train cannot be combined with disk trainer offload")
+    full_rollout_probe = args.rollout_only and not _is_pruned(args)
+    if args.rollout_probe_mode != "graph" and not full_rollout_probe:
+        raise ValueError("rollout_probe_mode is valid only for a full-model rollout-only profile")
+    if args.rollout_probe_capture is not None:
+        if not args.rollout_probe_capture.strip():
+            raise ValueError("rollout_probe_capture must be a nonblank path template")
+        if not full_rollout_probe:
+            raise ValueError("rollout_probe_capture is valid only for a full-model rollout-only profile")
 
 
 def _is_index_compute_layer(layer_number: int) -> bool:
@@ -260,295 +282,12 @@ def _is_index_compute_layer(layer_number: int) -> bool:
 
 
 def _pipeline_stage_starts(args: ScriptArgs) -> tuple[int, ...]:
-    if _is_pruned(args):
-        return (1,)
-    starts = [1]
-    for num_layers in _FULL_PIPELINE_LAYERS[:-1]:
-        starts.append(starts[-1] + num_layers)
-    return tuple(starts)
+    return args._topology.stage_starts
 
 
-def _sysfs_product_names() -> list[str]:
-    product_names = []
-    for path in sorted(Path("/sys/class/drm").glob("card*/device/product_name")):
-        if re.fullmatch(r"card\d+", path.parents[1].name):
-            try:
-                product_names.append(path.read_text().strip())
-            except OSError:
-                continue
-    return [name for name in product_names if name]
-
-
-def _find_named_values(value: object, names: set[str]) -> list[str]:
-    if isinstance(value, dict):
-        found = [str(item) for key, item in value.items() if key.lower() in names and isinstance(item, str)]
-        for item in value.values():
-            found.extend(_find_named_values(item, names))
-        return found
-    if isinstance(value, list):
-        return [found for item in value for found in _find_named_values(item, names)]
-    return []
-
-
-def _amd_smi_product_names(output: str) -> list[str]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
-        return re.findall(r"^\s*(?:MARKET_NAME|PRODUCT_NAME):\s*(.+?)\s*$", output, flags=re.MULTILINE)
-
-    if isinstance(payload, dict):
-        gpu_data = payload.get("gpu_data")
-        records = gpu_data if isinstance(gpu_data, list) else [payload]
-    else:
-        records = payload
-    records = records if isinstance(records, list) else [records]
-    product_names = []
-    for record in records:
-        market_names = _find_named_values(record, {"market_name"})
-        fallback_names = _find_named_values(record, {"product_name"})
-        candidates = market_names or fallback_names
-        matching_name = next((name for name in candidates if re.search(r"\bMI3(?:50|55)X\b", name, re.I)), None)
-        if matching_name:
-            product_names.append(matching_name)
-    return product_names
-
-
-def _product_sku(product_name: object) -> str | None:
-    match = re.search(r"\b(MI350X|MI355X)\b", str(product_name), re.I)
-    return match.group(1).upper() if match else None
-
-
-def _probe_product_names(expected_count: int) -> tuple[list[str], str, str | None]:
-    sysfs_names = _sysfs_product_names()
-    if len(sysfs_names) == expected_count and all(_product_sku(name) for name in sysfs_names):
-        return sysfs_names, "sysfs", None
-
-    try:
-        result = subprocess.run(
-            ["amd-smi", "static", "--asic", "--json"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return sysfs_names, "sysfs-incomplete", repr(error)
-
-    amd_smi_names = _amd_smi_product_names(result.stdout)
-    error = None if result.returncode == 0 else f"amd-smi exited with {result.returncode}"
-    return amd_smi_names, "amd-smi", error
-
-
-def _probe_mi35x_node() -> dict[str, object]:
-    """Inspect one Ray node without allocating a GPU or invoking a shell."""
-    try:
-        result = subprocess.run(
-            ["rocminfo"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return {
-            "node_id": str(ray.get_runtime_context().get_node_id()),
-            "hostname": socket.gethostname(),
-            "gfx950_count": 0,
-            "product_names": [],
-            "product_source": None,
-            "error": repr(error),
-        }
-
-    gfx950_count = len(re.findall(r"^\s*Name:\s+gfx950\s*$", result.stdout, flags=re.MULTILINE))
-    product_names, product_source, product_error = _probe_product_names(gfx950_count)
-    errors = []
-    if result.returncode != 0:
-        errors.append(f"rocminfo exited with {result.returncode}")
-    if product_error:
-        errors.append(product_error)
-    return {
-        "node_id": str(ray.get_runtime_context().get_node_id()),
-        "hostname": socket.gethostname(),
-        "gfx950_count": gfx950_count,
-        "product_names": product_names,
-        "product_source": product_source,
-        "error": "; ".join(errors) or None,
-    }
-
-
-def _collect_ray_cluster_inventory() -> tuple[
-    list[dict[str, object]], list[dict[str, object]], float, str
-]:
-    """Collect immutable node metadata plus a hard-affinity hardware probe per node."""
-    initialized_here = not ray.is_initialized()
-    if initialized_here:
-        # Multi-node preparation already relies on address="auto" in
-        # exec_command_multi_node. Requiring the same local cluster discovery
-        # here prevents inspecting one cluster and submitting to another.
-        ray.init(address="auto", log_to_driver=False)
-
-    try:
-        nodes = sorted(
-            (node for node in ray.nodes() if node.get("Alive")),
-            key=lambda node: str(node["NodeManagerAddress"]),
-        )
-        remote_probe = ray.remote(num_cpus=0)(_probe_mi35x_node)
-        probe_refs = [
-            remote_probe.options(
-                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=str(node["NodeID"]), soft=False)
-            ).remote()
-            for node in nodes
-        ]
-        probes = ray.get(probe_refs, timeout=120)
-        available_gpus = float(ray.available_resources().get("GPU", 0))
-        return nodes, probes, available_gpus, ray.util.get_node_ip_address()
-    finally:
-        if initialized_here:
-            ray.shutdown()
-
-
-def _ray_address_host(ray_address: str) -> str | None:
-    parsed = urlparse(ray_address)
-    return parsed.hostname if parsed.scheme in {"http", "https"} else None
-
-
-def _resolved_dashboard_addresses(host: str, driver_node_address: str) -> set[str]:
-    try:
-        addresses = {item[4][0] for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
-    except socket.gaierror:
-        return set()
-    if host == "localhost" or addresses & {"127.0.0.1", "::1"}:
-        addresses.add(driver_node_address)
-    return addresses
-
-
-def _configure_external_ray_network(node_addresses: tuple[str, ...] = ()) -> None:
-    """Keep control-plane and collectives traffic out of HTTP proxy paths."""
-    for name in _PROXY_ENV_VARS:
-        os.environ.pop(name, None)
-
-    ray_host = _ray_address_host(os.environ.get("RAY_ADDRESS", ""))
-    configured = os.environ.get("no_proxy", "") + "," + os.environ.get("NO_PROXY", "")
-    bypass = ["127.0.0.1", "localhost"]
-    bypass.extend(entry.strip() for entry in configured.split(",") if entry.strip())
-    bypass.extend(address for address in (ray_host, *node_addresses) if address)
-    value = ",".join(dict.fromkeys(bypass))
-    os.environ["no_proxy"] = value
-    os.environ["NO_PROXY"] = value
-
-
-def _validate_external_ray_cluster(args: ScriptArgs) -> tuple[str, ...]:
-    try:
-        nodes, probes, available_gpus, driver_node_address = _collect_ray_cluster_inventory()
-    except Exception as error:
-        raise RuntimeError(
-            "Could not inspect the external Ray cluster. Run the launcher on a joined Ray node "
-            "where ray.init(address='auto') reaches the same cluster as RAY_ADDRESS."
-        ) from error
-
-    assert args.num_nodes == _EXPECTED_FULL_NUM_NODES
-    assert args.num_gpus_per_node == _EXPECTED_GPUS_PER_NODE
-    expected_total_gpus = args.num_nodes * args.num_gpus_per_node
-    errors = []
-    if len(nodes) != args.num_nodes:
-        errors.append(f"expected exactly {args.num_nodes} alive nodes, found {len(nodes)}")
-    if available_gpus != expected_total_gpus:
-        errors.append(f"expected {expected_total_gpus} available GPUs, found {available_gpus:g}")
-
-    probes_by_node = {str(probe["node_id"]): probe for probe in probes}
-    records = []
-    product_skus = []
-    for node in nodes:
-        node_id = str(node["NodeID"])
-        address = str(node["NodeManagerAddress"])
-        gpu_resources = float(node.get("Resources", {}).get("GPU", 0))
-        probe = probes_by_node.get(node_id)
-        if gpu_resources != args.num_gpus_per_node:
-            errors.append(
-                f"node {address} advertises {gpu_resources:g} GPUs instead of {args.num_gpus_per_node}"
-            )
-        if probe is None:
-            errors.append(f"node {address} did not return its hard-affinity hardware probe")
-            continue
-        if probe.get("error"):
-            errors.append(f"node {address} hardware probe failed: {probe['error']}")
-        if probe.get("gfx950_count") != args.num_gpus_per_node:
-            errors.append(
-                f"node {address} reported {probe.get('gfx950_count', 0)} gfx950 agents "
-                f"instead of {args.num_gpus_per_node}"
-            )
-        product_names = probe.get("product_names")
-        if not isinstance(product_names, list) or len(product_names) != args.num_gpus_per_node:
-            errors.append(
-                f"node {address} reported {len(product_names) if isinstance(product_names, list) else 0} "
-                f"GPU product names instead of {args.num_gpus_per_node}"
-            )
-            product_names = []
-        normalized_skus = [sku for product_name in product_names if (sku := _product_sku(product_name))]
-        if normalized_skus != [args.hardware] * args.num_gpus_per_node:
-            errors.append(
-                f"node {address} product names do not match requested {args.hardware}: {product_names}"
-            )
-        product_skus.extend(normalized_skus)
-        records.append(
-            {
-                "node_id": node_id,
-                "address": address,
-                "hostname": probe.get("hostname"),
-                "gpu_resources": gpu_resources,
-                "gfx950_agents": probe.get("gfx950_count"),
-                "product_names": product_names,
-                "product_source": probe.get("product_source"),
-            }
-        )
-
-    unexpected_probe_ids = set(probes_by_node) - {str(node["NodeID"]) for node in nodes}
-    if unexpected_probe_ids:
-        errors.append(f"hardware probes returned unexpected node IDs: {sorted(unexpected_probe_ids)}")
-    if set(product_skus) != {args.hardware}:
-        errors.append(f"cluster GPU products are not homogeneous {args.hardware}: {sorted(set(product_skus))}")
-
-    node_addresses = tuple(str(node["NodeManagerAddress"]) for node in nodes)
-    ray_host = _ray_address_host(os.environ["RAY_ADDRESS"])
-    if ray_host is None:
-        errors.append("RAY_ADDRESS must be an HTTP(S) Ray dashboard URL with an explicit host")
-    else:
-        resolved_dashboard = _resolved_dashboard_addresses(ray_host, driver_node_address)
-        if resolved_dashboard and not resolved_dashboard.intersection(node_addresses):
-            errors.append(
-                f"RAY_ADDRESS host {ray_host!r} resolves outside the inspected cluster: "
-                f"{sorted(resolved_dashboard)}"
-            )
-    if errors:
-        raise RuntimeError(
-            f"External Ray cluster is not a dedicated homogeneous 8x8 {args.hardware} allocation: "
-            + "; ".join(errors)
-        )
-
-    print("Validated dedicated GLM-5.2 Ray cluster: " + json.dumps(records, sort_keys=True))
-    return node_addresses
-
-
-def _require_external_ray(args: ScriptArgs, action: str) -> None:
-    if args.num_nodes <= 1:
-        return
-    if not U.get_bool_env_var("MILES_SCRIPT_EXTERNAL_RAY"):
-        raise RuntimeError(
-            f"Multi-node GLM-5.2 {action} requires an already joined Ray cluster. "
-            "Export MILES_SCRIPT_EXTERNAL_RAY=1 first."
-        )
-    if not os.environ.get("RAY_ADDRESS", "").strip():
-        raise RuntimeError(
-            f"Multi-node GLM-5.2 {action} requires an explicit RAY_ADDRESS for the existing cluster."
-        )
-    if _ray_address_host(os.environ["RAY_ADDRESS"]) is None:
-        raise RuntimeError(
-            f"Multi-node GLM-5.2 {action} requires RAY_ADDRESS to be an HTTP(S) Ray dashboard URL."
-        )
-
-    _configure_external_ray_network()
-    node_addresses = _validate_external_ray_cluster(args)
-    _configure_external_ray_network(node_addresses)
+_amd_smi_product_names = _cluster._amd_smi_product_names
+_probe_product_names = _cluster._probe_product_names
+_require_external_ray = _cluster._require_external_ray
 
 
 def _get_parallel_config(args: ScriptArgs) -> str:
@@ -556,35 +295,14 @@ def _get_parallel_config(args: ScriptArgs) -> str:
     assert all(_is_index_compute_layer(layer) for layer in starts), (
         f"Every GLM DSA pipeline stage must start on an index-compute layer; got {starts}"
     )
-    if _is_pruned(args):
-        return (
-            "--tensor-model-parallel-size 4 "
-            "--sequence-parallel "
-            "--pipeline-model-parallel-size 1 "
-            "--context-parallel-size 1 "
-            "--expert-model-parallel-size 4 "
-            "--expert-tensor-parallel-size 1 "
-        )
-    return (
-        "--tensor-model-parallel-size 8 "
-        "--sequence-parallel "
-        "--pipeline-model-parallel-size 4 "
-        "--decoder-first-pipeline-num-layers 18 "
-        "--decoder-last-pipeline-num-layers 20 "
-        "--context-parallel-size 1 "
-        "--expert-model-parallel-size 16 "
-        "--expert-tensor-parallel-size 1 "
-    )
+    return args._topology.megatron_args()
 
 
 def _expected_indexer_types(num_layers: int) -> list[str]:
     return ["full" if _is_index_compute_layer(layer) else "shared" for layer in range(1, num_layers + 1)]
 
 
-def _nonempty_file_size(path: Path) -> int:
-    if not path.is_file() or (size := path.stat().st_size) <= 0:
-        raise FileNotFoundError(f"Required artifact file {path} is missing or empty")
-    return size
+_nonempty_file_size = _artifacts._nonempty_file_size
 
 
 def _read_safetensor_index(checkpoint_dir: Path) -> tuple[dict[str, object], set[str]]:
@@ -683,6 +401,11 @@ def _validate_glm_checkpoint_at(
 ) -> None:
     _require_matching_manifest(checkpoint_dir, expected_manifest)
     _validate_glm_config(checkpoint_dir, model_name)
+    _artifacts.validate_exact_file(
+        checkpoint_dir / "config.json",
+        _SOURCE_CONFIG_ASSETS[model_name],
+        description="Pinned source config",
+    )
 
     expected_num_weights, expected_num_shards, expected_total_size = _CHECKPOINT_INDEX_LAYOUTS[model_name]
     _validate_safetensor_index(
@@ -690,6 +413,11 @@ def _validate_glm_checkpoint_at(
         expected_num_weights=expected_num_weights,
         expected_num_shards=expected_num_shards,
         expected_total_size=expected_total_size,
+    )
+    _artifacts.validate_exact_file(
+        checkpoint_dir / "model.safetensors.index.json",
+        _SOURCE_INDEX_ASSETS[model_name],
+        description="Pinned source index",
     )
 
 
@@ -710,44 +438,7 @@ def _artifact_manifest(path: Path) -> dict[str, object] | None:
         return json.load(manifest_file)
 
 
-def _validate_torch_dist_references(release_dir: Path) -> None:
-    # Import only in the internal validator: torch.distributed.checkpoint is
-    # expensive and every normal launcher invocation should remain lightweight.
-    from torch.distributed.checkpoint import FileSystemReader
-
-    try:
-        metadata = FileSystemReader(release_dir).read_metadata()
-    except Exception as error:
-        raise RuntimeError(f"Could not read torch_dist metadata from {release_dir}") from error
-    storage_data = getattr(metadata, "storage_data", None)
-    if not isinstance(storage_data, dict) or not storage_data:
-        raise RuntimeError(f"{release_dir / '.metadata'} contains no torch_dist storage records")
-
-    required_sizes: dict[Path, int] = {}
-    for storage in storage_data.values():
-        relative = Path(str(getattr(storage, "relative_path", "")))
-        offset = getattr(storage, "offset", None)
-        length = getattr(storage, "length", None)
-        if (
-            not relative.name
-            or relative.is_absolute()
-            or ".." in relative.parts
-            or relative.suffix != ".distcp"
-            or not isinstance(offset, int)
-            or not isinstance(length, int)
-            or offset < 0
-            or length <= 0
-        ):
-            raise RuntimeError(f"{release_dir / '.metadata'} contains an invalid storage record {storage!r}")
-        required_sizes[relative] = max(required_sizes.get(relative, 0), offset + length)
-
-    for relative, required_size in required_sizes.items():
-        actual_size = _nonempty_file_size(release_dir / relative)
-        if actual_size < required_size:
-            raise RuntimeError(
-                f"torch_dist shard {release_dir / relative} is truncated: "
-                f"{actual_size} bytes, metadata requires {required_size}"
-            )
+_validate_torch_dist_references = _artifacts._validate_torch_dist_references
 
 
 def _artifact_file_inventory(path: Path, manifest: dict[str, object]) -> dict[str, int]:
@@ -756,6 +447,10 @@ def _artifact_file_inventory(path: Path, manifest: dict[str, object]) -> dict[st
         _, shards = _read_safetensor_index(path)
         relative_paths = [Path("config.json"), Path("model.safetensors.index.json")]
         relative_paths.extend(Path(shard) for shard in shards)
+        relative_paths.extend(
+            Path(relative)
+            for relative in _artifacts.runtime_hf_inventory(path, _RUNTIME_HF_ASSETS)
+        )
     elif artifact == "megatron-torch-dist-checkpoint":
         tracker = path / "latest_checkpointed_iteration.txt"
         _nonempty_file_size(tracker)
@@ -892,6 +587,7 @@ def _validate_artifact_bundle(
     model_revision: str,
     fp8_rollout: bool,
     require_source: bool,
+    rollout_only: bool = False,
 ) -> None:
     source_manifest = _source_manifest_values(model_org, model_name, model_revision)
     if require_source or not fp8_rollout:
@@ -906,10 +602,11 @@ def _validate_artifact_bundle(
             model_name=model_name,
             expected_manifest=_fp8_manifest_values(source_manifest),
         )
-    _require_matching_manifest(
-        root / f"{model_name}_torch_dist",
-        _torch_dist_manifest_values(model_name, source_manifest),
-    )
+    if not rollout_only:
+        _require_matching_manifest(
+            root / f"{model_name}_torch_dist",
+            _torch_dist_manifest_values(model_name, source_manifest),
+        )
 
 
 def _artifact_validation_command(args: ScriptArgs, root: str, *, require_source: bool) -> str:
@@ -923,6 +620,8 @@ def _artifact_validation_command(args: ScriptArgs, root: str, *, require_source:
         command += " --fp8-rollout"
     if require_source:
         command += " --require-source"
+    if _is_rollout_only(args):
+        command += " --rollout-only"
     return command
 
 
@@ -972,10 +671,14 @@ def _prepare_download(args: ScriptArgs) -> None:
         data_dir=args.data_dir,
         revision=args.data_revision,
     )
+    _dataset._validate_after_download(args)
     _write_artifact_manifest(Path(args.model_dir) / args.model_name, _source_manifest(args))
 
 
 def _prepare_megatron_ckpt(args: ScriptArgs) -> None:
+    if _is_rollout_only(args):
+        print("Skip Megatron checkpoint conversion for the rollout-only profile")
+        return
     if _is_pruned(args):
         extra_args = (
             "--tensor-model-parallel-size 1 "
@@ -1031,11 +734,12 @@ def _prepare_cp(args: ScriptArgs, *, skip_existing: bool = False) -> None:
         else:
             U.rsync_simple(path_src=path_src, path_dst=path_dst, num_nodes=args.num_nodes)
 
-    torch_dist_dst = f"{args.model_local_dir}/{args.model_name}_torch_dist"
-    torch_dist_sentinel = Path(torch_dist_dst) / "latest_checkpointed_iteration.txt"
     may_skip_local_copy = skip_existing and args.num_nodes == 1
-    if not (may_skip_local_copy and torch_dist_sentinel.exists()):
-        copy_checkpoint(f"{args.model_dir}/{args.model_name}_torch_dist", torch_dist_dst)
+    if not _is_rollout_only(args):
+        torch_dist_dst = f"{args.model_local_dir}/{args.model_name}_torch_dist"
+        torch_dist_sentinel = Path(torch_dist_dst) / "latest_checkpointed_iteration.txt"
+        if not (may_skip_local_copy and torch_dist_sentinel.exists()):
+            copy_checkpoint(f"{args.model_dir}/{args.model_name}_torch_dist", torch_dist_dst)
 
     hf_name = f"{args.model_name}_fp8" if args.fp8_rollout else args.model_name
     hf_dst = f"{args.model_local_dir}/{hf_name}"
@@ -1047,10 +751,9 @@ def _prepare_cp(args: ScriptArgs, *, skip_existing: bool = False) -> None:
 
 def _checkpoint_args(args: ScriptArgs) -> str:
     hf_name = f"{args.model_name}_fp8" if args.fp8_rollout else args.model_name
-    checkpoint = (
-        f"--hf-checkpoint {args.model_local_dir}/{hf_name} "
-        f"--ref-load {args.model_local_dir}/{args.model_name}_torch_dist "
-    )
+    checkpoint = f"--hf-checkpoint {args.model_local_dir}/{hf_name} "
+    if not _is_rollout_only(args):
+        checkpoint += f"--ref-load {args.model_local_dir}/{args.model_name}_torch_dist "
     if not args.skip_saving:
         load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
         checkpoint += (
@@ -1061,6 +764,16 @@ def _checkpoint_args(args: ScriptArgs) -> str:
 
 
 def _rollout_args(args: ScriptArgs) -> str:
+    assert args.rollout_max_prompt_len is not None and args.rollout_max_response_len is not None
+    full_rollout = _profiles.full_model_rollout_args(
+        args._topology,
+        rollout_only=args.rollout_only,
+        data_dir=args.data_dir,
+        max_prompt_len=args.rollout_max_prompt_len,
+        max_response_len=args.rollout_max_response_len,
+    )
+    if full_rollout is not None:
+        return full_rollout
     return (
         f"--prompt-data {args.data_dir}/dapo-math-17k/dapo-math-17k.jsonl "
         "--input-key prompt --label-key label --apply-chat-template --rollout-shuffle "
@@ -1093,12 +806,15 @@ def _optimizer_args(args: ScriptArgs) -> str:
 
 def _sglang_args(args: ScriptArgs) -> str:
     world_size = args.num_gpus_per_node
+    router_policy = "round_robin" if args.rollout_only and not _is_pruned(args) else "consistent_hashing"
     sglang = (
         f"--rollout-num-gpus-per-engine {world_size} "
         f"--sglang-tp-size {world_size} --sglang-dp-size 1 --sglang-ep-size {world_size} "
         f"--sglang-mem-fraction-static {args.sglang_mem_fraction_static} "
-        "--sglang-router-policy consistent_hashing "
+        f"--sglang-router-policy {router_policy} "
     )
+    if args.rollout_probe_mode == "eager":
+        sglang += "--sglang-disable-cuda-graph "
     if args.fp8_rollout and args.use_deepep:
         sglang += "--sglang-moe-a2a-backend mori --sglang-deepep-mode auto "
     if args.enable_mtp:
@@ -1132,14 +848,19 @@ def _misc_args(args: ScriptArgs) -> str:
         "--train-memory-margin-bytes 4294967296 "
         "--rollout-health-check-interval 300 --rollout-health-check-timeout 300 "
     )
-    if args.offload_train_target == "cpu":
-        misc += "--rematerialize-param-from-master-weight "
-    else:
-        misc += (
-            f"--offload-train-target disk --offload-train-disk-dir {args.offload_train_disk_dir} "
+    if not _is_rollout_only(args):
+        no_train_offload = "--no-offload-train" in _profiles._validate_diagnostic_extra_args(
+            args.extra_args
         )
-        if args.stream_optimizer_state_to_disk:
-            misc += "--stream-optimizer-state-to-disk "
+        if args.offload_train_target == "cpu":
+            if not no_train_offload:
+                misc += "--rematerialize-param-from-master-weight "
+        else:
+            misc += (
+                f"--offload-train-target disk --offload-train-disk-dir {args.offload_train_disk_dir} "
+            )
+            if args.stream_optimizer_state_to_disk:
+                misc += "--stream-optimizer-state-to-disk "
     if args.freeze_indexer:
         misc += "--freeze-indexer "
     if args.freeze_router:
@@ -1148,6 +869,10 @@ def _misc_args(args: ScriptArgs) -> str:
         misc += "--use-rollout-routing-replay "
     if args.enable_indexer_replay:
         misc += "--use-rollout-indexer-replay "
+    if _is_rollout_only(args):
+        misc += "--debug-rollout-only "
+    if args.rollout_probe_capture is not None:
+        misc += f"--save-debug-rollout-data {shlex.quote(args.rollout_probe_capture)} "
     return misc
 
 
@@ -1163,6 +888,8 @@ def _configure_rocm_process_env() -> None:
 
 def _execute_train(args: ScriptArgs) -> None:
     _require_external_ray(args, "training")
+    _cluster._validate_local_hardware(args)
+    _dataset._validate_before_train(args)
     _validate_node_local_artifacts(args)
     _configure_rocm_process_env()
 
@@ -1181,7 +908,7 @@ def _execute_train(args: ScriptArgs) -> None:
         f"{_sglang_args(args)} "
         f"{_misc_args(args)} "
         f"{args.extra_args} "
-    )
+    ).strip()
     extra_env_vars = {
         "MILES_HARDWARE_PLATFORM": "rocm",
         "SGLANG_NSA_FORCE_MLA": "1",
@@ -1210,6 +937,7 @@ def _validate_artifacts_internal(
     model_revision: Annotated[str, typer.Option()],
     fp8_rollout: bool = False,
     require_source: bool = False,
+    rollout_only: bool = False,
 ) -> None:
     """Validate one host's prepared artifacts; invoked synchronously by the public commands."""
     if model_name not in _CHECKPOINT_INDEX_LAYOUTS:
@@ -1221,6 +949,7 @@ def _validate_artifacts_internal(
         model_revision=model_revision,
         fp8_rollout=fp8_rollout,
         require_source=require_source,
+        rollout_only=rollout_only,
     )
 
 
@@ -1228,6 +957,8 @@ def _validate_artifacts_internal(
 @U.dataclass_cli
 def full_train(args: ScriptArgs) -> None:
     """Download, convert, copy to node-local storage, and train."""
+    _require_external_ray(args, "full training")
+    _cluster._validate_local_hardware(args)
     _prepare_download(args)
     _validate_glm_checkpoint(args)
     if args.fp8_rollout:
@@ -1241,11 +972,22 @@ def full_train(args: ScriptArgs) -> None:
 @U.dataclass_cli
 def prepare(args: ScriptArgs) -> None:
     """Download and convert on the shared filesystem."""
+    _require_external_ray(args, "preparation")
+    if args.fp8_rollout or not _is_rollout_only(args):
+        _cluster._validate_local_hardware(args)
     _prepare_download(args)
     _validate_glm_checkpoint(args)
     if args.fp8_rollout:
         _convert_to_fp8(args)
     _prepare_megatron_ckpt(args)
+
+
+@app.command()
+@U.dataclass_cli
+def download(args: ScriptArgs) -> None:
+    """Download and validate pinned model/data artifacts without requiring Ray or GPUs."""
+    _prepare_download(args)
+    _validate_glm_checkpoint(args)
 
 
 @app.command()

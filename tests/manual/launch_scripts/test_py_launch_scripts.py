@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 from collections.abc import Callable
@@ -22,6 +23,17 @@ from tests.fast.launch_scripts.sh_harness import REPO_ROOT, assert_matches_snaps
 _SNAPSHOT_DIR = REPO_ROOT / "tests" / "snapshots" / "launch_scripts" / "py"
 
 _SCRIPTS_IMPORTABLE_ONLY_UNDER_THE_NPU_PATCH = {"scripts/run_qwen3_4b_npu.py"}
+_GLM_RUNTIME_HF_PAYLOADS = {
+    "chat_template.jinja": b"snapshot-chat-template",
+    "generation_config.json": b"snapshot-generation-config",
+    "tokenizer.json": b"snapshot-tokenizer-json",
+    "tokenizer_config.json": b"snapshot-tokenizer-config",
+}
+
+
+def _file_identity(path: Path) -> tuple[int, str]:
+    payload = path.read_bytes()
+    return len(payload), hashlib.sha256(payload).hexdigest()
 
 
 def _glm_checkpoint(sandbox: Path, model_name: str, num_layers: int) -> dict[str, object]:
@@ -95,6 +107,8 @@ def _glm_checkpoint(sandbox: Path, model_name: str, num_layers: int) -> dict[str
     )
     for shard_name in shard_names:
         (checkpoint / shard_name).write_bytes(b"fixture")
+    for name, payload in _GLM_RUNTIME_HF_PAYLOADS.items():
+        (checkpoint / name).write_bytes(payload)
     return {"model_dir": str(model_dir)}
 
 
@@ -158,10 +172,32 @@ def recorded(request, monkeypatch, tmp_path):
     freeze_environment(monkeypatch, hardware=_HARDWARE_A_RECORDING_REPRESENTS.get(rel, FROZEN_HARDWARE))
     recording = install_command_recorder(monkeypatch)
     module = import_launch_script(REPO_ROOT / rel)
+    overrides = _SCRIPTS_WHOSE_DEFAULTS_ARE_UNSUPPORTED.get(rel, lambda sandbox: {})(tmp_path)
+    if rel == "scripts/amd/run_glm5_2_744b_a40b.py":
+        monkeypatch.setattr(
+            module,
+            "_RUNTIME_HF_ASSETS",
+            {
+                name: (len(payload), hashlib.sha256(payload).hexdigest())
+                for name, payload in _GLM_RUNTIME_HF_PAYLOADS.items()
+            },
+        )
+        monkeypatch.setattr(module._cluster, "_validate_local_hardware", lambda args: None)
+        checkpoint = Path(overrides["model_dir"]) / "GLM-5.2_5layer"
+        monkeypatch.setattr(
+            module,
+            "_SOURCE_CONFIG_ASSETS",
+            {"GLM-5.2_5layer": _file_identity(checkpoint / "config.json")},
+        )
+        monkeypatch.setattr(
+            module,
+            "_SOURCE_INDEX_ASSETS",
+            {"GLM-5.2_5layer": _file_identity(checkpoint / "model.safetensors.index.json")},
+        )
     call_entrypoint(
         module,
         entrypoint,
-        _SCRIPTS_WHOSE_DEFAULTS_ARE_UNSUPPORTED.get(rel, lambda sandbox: {})(tmp_path),
+        overrides,
         sandbox=tmp_path,
     )
     return rel, entrypoint, recording, tmp_path

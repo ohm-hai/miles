@@ -237,6 +237,98 @@ Run the payload hash once while staging, not inside the short GPU window. A matc
 `.miles-artifact.json` is provenance evidence; it is not a substitute for that transfer
 integrity record.
 
+### Pin and preflight the GRPO data
+
+The training input is the transformed
+[`zhuzilin/dapo-math-17k`](https://huggingface.co/datasets/zhuzilin/dapo-math-17k)
+JSONL, not the source DAPO parquet schema. Download it once, before reserving GPUs, at the
+same absolute path that will be passed as `--data-dir`:
+
+```bash
+export GLM_DATA_DIR=/shared/datasets
+hf download --repo-type dataset zhuzilin/dapo-math-17k \
+  --revision 2e65612930298bde4c5d58fd97b3f23a483aaff9 \
+  --local-dir "${GLM_DATA_DIR}/dapo-math-17k"
+
+python tools/validate_grpo_dataset.py \
+  "${GLM_DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl" \
+  --profile dapo-math-17k \
+  | tee "${BRINGUP_ROOT}/dapo-math-17k-validation.json"
+```
+
+The immutable profile requires all of the following, and parses every line instead of
+silently skipping malformed JSON:
+
+| Property | Required value |
+|---|---:|
+| Revision | `2e65612930298bde4c5d58fd97b3f23a483aaff9` |
+| JSONL SHA-256 | `cc9c39c2aa19177abe9464741e121cf4cac90fd25484ef3cdf86535101e3a5b6` |
+| File size | 10,490,834 bytes |
+| Rows / unique prompts | 17,398 / 17,398 |
+| Row keys | exactly `prompt`, `label` |
+| `prompt` | one `{role: "user", content: <non-empty string>}` message |
+| `label` | non-empty string |
+
+Every prompt also contains both the `Answer:` and `\boxed` instructions expected by this
+recipe. The launcher passes `--input-key prompt --label-key label --apply-chat-template`
+and sends the label directly to `--rm-type deepscaler`; there is no `reward_model` or
+metadata field to remap. DeepScaler assigns zero reward if a response does not close
+thinking with `</think>` (or use its legacy `###Response` separator), and then requires a
+boxed answer in the remaining text. Verify that boundary inside the frozen image:
+
+```bash
+python - <<'PY'
+import json
+import os
+
+from miles.rollout.rm_hub.deepscaler import get_deepscaler_rule_based_reward
+
+dataset_path = os.path.join(os.environ["GLM_DATA_DIR"], "dapo-math-17k", "dapo-math-17k.jsonl")
+with open(dataset_path, encoding="utf-8") as dataset:
+    first = json.loads(next(dataset))
+label = first["label"]
+assert get_deepscaler_rule_based_reward(rf"</think>Answer: \boxed{{{label}}}", label) == 1
+assert get_deepscaler_rule_based_reward(rf"Answer: \boxed{{{label}}}", label) == 0
+PY
+```
+
+After the full HF checkpoint is staged, run the tokenizer-aware preflight in the same
+container that will train. It uses only local files, applies the checkpoint's chat template
+with an assistant generation prompt, and rejects any prompt over the full recipe's limit:
+
+```bash
+python tools/validate_grpo_dataset.py \
+  "${GLM_DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl" \
+  --profile dapo-math-17k \
+  --tokenizer "${GLM_MODEL_DIR}/GLM-5.2" \
+  --max-prompt-tokens 4096 \
+  --expected-min-prompt-tokens 73 \
+  --expected-max-prompt-tokens 1521 \
+  | tee "${BRINGUP_ROOT}/dapo-math-17k-tokenizer-validation.json"
+```
+
+At the pinned model and data revisions the rendered lengths are 73-1,521 tokens, so all
+17,398 rows pass the full-model 4,096-token cap. The five-layer smoke cap is 1,024 and
+intentionally filters seven long prompts, leaving 17,391; do not mistake that PoC behavior
+for the full recipe. The training batch consumes eight prompts with eight generations each
+(64 samples) per rollout and shuffles on epoch rollover. The default 3,000 rollouts reuse
+the dataset after the first 2,174 complete prompt batches; qualification gates use only the
+small rollout counts stated below.
+
+This acceptance path deliberately uses the same pinned DAPO payload for the five-layer
+smoke, full-model liveness gates, resume test, and eventual GRPO run; it does not create an
+unrecorded train split. The AMD launcher does not currently download or schedule AIME
+evaluation. Consequently these gates establish training and reward correctness, not a
+model-quality gain. After BF16 E2E and resume pass, add a separately pinned AIME-2024
+evaluation recipe and baseline before making a quality claim; do not mix evaluation
+problems into the GRPO prompt stream.
+
+`RolloutManager` is not pinned to the Ray head by this recipe and is allowed to start on any
+node. Therefore `${GLM_DATA_DIR}` must be a genuinely shared mount at the same path on all
+eight nodes, or the 10.5 MB dataset directory must be copied to that path on every node.
+The launcher's pre-train validation probes every node and stops if any node sees a missing
+or different payload. Do not rely on a head-only download into node-local storage.
+
 ### Host-memory and local-NVMe budget
 
 Colocation moves a frontier-scale allocation off HBM during each half of the cycle. A
@@ -337,6 +429,85 @@ node addresses to `no_proxy`, and prints the accepted inventory. Save that JSON 
 rank/host/GPU mapping. Exported NCCL/RCCL socket, IB, and debug variables are forwarded into
 the Ray job. Do not set external-Ray mode for standalone Gate 1.
 
+### Single-node qualification driver
+
+Use the checked-in
+[`test_glm5_2_amd_single_node_stages.py`](../../../tests/e2e/megatron/model_scripts/test_glm5_2_amd_single_node_stages.py)
+as the first executable entrypoint during a short MI350X or MI355X allocation. It orders
+the one-node boundaries and makes the generated-rollout-to-trainer replay explicit; it
+does not turn an unrun GPU path into a validation claim.
+
+Configure immutable storage locations once, then run the ladder in this order:
+
+```bash
+unset MILES_SCRIPT_EXTERNAL_RAY RAY_ADDRESS MASTER_ADDR
+export MILES_GLM52_AMD_HARDWARE=MI355X
+export MILES_GLM52_TEST_ROOT=/shared/glm52-amd-single-node
+export MILES_GLM52_MODEL_DIR=/shared/models
+export MILES_GLM52_MODEL_LOCAL_DIR=/local_nvme/models
+export MILES_GLM52_DATA_DIR=/shared/datasets
+
+# Evidence-backed 4-GPU TP4/EP4 shape: H16 sparse-attention tiles.
+export HIP_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+python tests/e2e/megatron/model_scripts/test_glm5_2_amd_single_node_stages.py \
+  --profile poc-h16 --stage five-layer-all
+unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+
+# Guarded 8-GPU TP8/EP8 shape: H8 tiles matching the full recipe's local shape.
+python tests/e2e/megatron/model_scripts/test_glm5_2_amd_single_node_stages.py \
+  --profile full-shape-h8 --stage five-layer-all
+
+# Full 744B checkpoint: separate eager and graph SGLang load/decode probes.
+python tests/e2e/megatron/model_scripts/test_glm5_2_amd_single_node_stages.py \
+  --stage full-rollout
+```
+
+If `MILES_GLM52_AMD_HARDWARE` is unset, the driver detects the SKU. If it is set, the
+driver checks it against every visible GPU and aborts on a mixed SKU, a wrong count, or an
+MI350X/MI355X mismatch; this prevents a MI350 run from being archived as MI355 evidence.
+The H16 run intentionally requires exactly four visible GPUs, so retain the visibility
+restriction on an eight-GPU host only for that command and remove it before H8 or full
+rollout. The driver never silently treats an eight-GPU view as the four-GPU PoC.
+
+The five-layer `*-all` path runs the H8/H16 TileLang forward/backward parity test, prepares
+the pinned checkpoint and DAPO data, captures one deterministic eager rollout, strictly
+replays that capture through trainer forward/backward/optimizer/save, and finally runs two
+live GRPO rollout-to-weight-sync cycles. It rejects an empty/stale capture, a sample without
+a completed or truncated response, non-finite rollout log probabilities or reward, and a
+trainer run without a checkpoint tracker. H16 is the PR #2268 evidence-backed *shape path*,
+but this driver still needs a new physical pass on the pinned image. H8 is a guarded shape
+qualification with no prior hardware pass.
+
+`full-rollout` is deliberately narrower. It stages only the pinned 1.51 TB HF source, then
+runs `full-rollout-eager` before `full-rollout-graph`. Each substage loads one TP8/EP8
+SGLang engine across all eight GPUs and captures exactly one deterministic completion with
+a response limit of 128 tokens. The driver requires a fresh capture with one completed or
+truncated response, finite per-token rollout log probabilities, and a finite DAPO reward.
+Keeping eager and graph captures separate means graph compilation cannot obscure basic
+checkpoint load and NSA prefill/decode. The combined alias then requires identical prompt
+and response token IDs and a maximum per-token eager/graph log-probability difference of
+`0.03`, the declared BF16 tolerance; the direct substages validate their own captures but
+do not perform this cross-mode comparison. Both skip Megatron checkpoint conversion, trainer
+parameter/optimizer initialization, backward, optimizer update, checkpoint save, and
+weight synchronization. `--debug-rollout-only` still starts lightweight Megatron control
+actors, torch.distributed, and tokenizer plumbing; standalone SGLang isolation is not
+implemented. A pass is useful full-checkpoint rollout-path load/decode evidence; it is
+**not single-node full-model training** and is **not multi-node validation**.
+
+Each stage can also be resumed independently with `--stage kernel`,
+`five-layer-prepare`, `five-layer-rollout`, `five-layer-trainer`, `five-layer-grpo`,
+`full-rollout-eager`, or `full-rollout-graph`.
+The trainer stage requires the rollout capture from the same profile, and every execution
+stage requires prepared shared and node-local artifacts. Run the entire ladder separately
+for MI350X and MI355X; both are gfx950, but a result on one SKU does not qualify the other.
+The driver fails closed if `MILES_SCRIPT_EXTERNAL_RAY` or `RAY_ADDRESS` is still set, or
+if `MASTER_ADDR` is non-loopback; use a clean shell and unset all three explicitly. It does
+not silently switch modes, because doing so could make the generic local launcher cleanup
+interfere with an existing cluster head.
+After both five-layer shapes pass, continue with Gates 2-5 below for the locked 8x8 scale
+plan rather than attempting to fit the full actor and optimizer on one node.
+
 ### Gate 1: re-establish the five-layer boundary
 
 Start with BF16 actor and BF16 rollout weights (the KV cache remains FP8 E4M3). Preserve
@@ -346,6 +517,10 @@ revisions, node-local copy validation, the current Megatron API, and the SGLang 
 still make this a revalidation rather than a claim that PR #2268 reproduced byte-for-byte:
 
 ```bash
+# Required when this gate runs on an eight-GPU host; harmless on a four-GPU allocation.
+unset MILES_SCRIPT_EXTERNAL_RAY RAY_ADDRESS MASTER_ADDR
+export HIP_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 python "${GLM_AMD_SCRIPT}" full-train \
   --hardware MI355X \
   --model-org Pinaster --model-name GLM-5.2_5layer \
@@ -356,6 +531,7 @@ python "${GLM_AMD_SCRIPT}" full-train \
   --data-dir "${GLM_DATA_DIR}" --output-dir "${BRINGUP_ROOT}" \
   --extra-args "--ci-test --ci-disable-logprobs-checker --save-interval 1 \
     --save-debug-rollout-data ${BRINGUP_ROOT}/5layer/rollout_data/{rollout_id}.pt"
+unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
 ```
 
 `--ci-disable-logprobs-checker` reproduces the current PoC condition; it is not allowed in
@@ -378,6 +554,11 @@ including the 18/20 pipeline edges; that storage layout is distinct from the TP8
 layout and is expected:
 
 ```bash
+# Gate 1 used a clean local shell; reconnect this process to the inspected 8x8 cluster.
+export MASTER_ADDR="${HEAD_IP}"
+export RAY_ADDRESS="http://${HEAD_IP}:8265"
+export MILES_SCRIPT_EXTERNAL_RAY=1
+
 python "${GLM_AMD_SCRIPT}" prepare \
   --hardware MI355X \
   --model-org zai-org --model-name GLM-5.2 \
@@ -427,27 +608,47 @@ zero/NaN/Inf gradient, RCCL timeout, or less than 10% HBM headroom. If optimizer
 needed, first prove that host RAM and NUMA bandwidth can hold it, then repeat this entire
 gate with `--enable-optimizer-offload`; do not change it mid-run.
 
-### Gate 3: full model, SGLang only
+### Gate 3: full model, rollout path only
 
 The eight-GPU engine uses TP8/H8, but the checked-in H8 unit test exercises the trainer
 sparse-MLA kernel, not SGLang's prefill/decode path. Treat engine loading and live H8
 attention as two subgates. First disable graph capture and request only a minimal decode;
-this isolates checkpoint loading, FP32 router invariants, and eager kernel compilation:
+this isolates checkpoint loading, FP32 router invariants, and eager kernel compilation.
+The rollout-only implementation retains lightweight Megatron control ranks,
+torch.distributed, and tokenizer setup while skipping model parameters, optimizer, and
+backward; it is not a standalone SGLang process-isolation test. Run:
 
 ```bash
+mkdir -p "${BRINGUP_ROOT}/gate3" || exit 1
+GATE3_EVIDENCE_ROOT="$(
+  mktemp -d "${BRINGUP_ROOT}/gate3/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXXXX"
+)" || exit 1
+GATE3_RUN_ID="${GATE3_EVIDENCE_ROOT##*/}"
+GATE3_EAGER_DETAILS="${GATE3_EVIDENCE_ROOT}/eager-details"
+GATE3_GRAPH_DETAILS="${GATE3_EVIDENCE_ROOT}/graph-details"
+
 python "${GLM_AMD_SCRIPT}" train \
   --hardware MI355X \
   --model-org zai-org --model-name GLM-5.2 \
   --num-nodes 8 --num-gpus-per-node 8 --num-rollout 1 \
+  --rollout-only \
+  --rollout-probe-mode eager \
+  --rollout-probe-capture \
+    "${GATE3_EAGER_DETAILS}/rollout_data/{rollout_id}.pt" \
   --rollout-max-response-len 32 \
   --sglang-mem-fraction-static 0.65 --sglang-max-running-requests 8 \
-  --run-id glm52-amd-full-sglang-eager \
+  --run-id "glm52-amd-full-sglang-eager-${GATE3_RUN_ID}" \
   --model-dir "${GLM_MODEL_DIR}" --model-local-dir "${GLM_LOCAL_DIR}" \
   --data-dir "${GLM_DATA_DIR}" --output-dir "${BRINGUP_ROOT}" \
-  --extra-args "--sglang-disable-cuda-graph --debug-rollout-only \
-    --debug-exit-after-rollout 1 --save-debug-rollout-data \
-    ${BRINGUP_ROOT}/full_sglang_eager/rollout_data/{rollout_id}.pt"
+  --extra-args "--debug-exit-after-rollout 1 --use-miles-dashboard \
+    --dump-details ${GATE3_EAGER_DETAILS}"
 ```
+
+Keep the four `GATE3_*` variables in the same shell for all Gate 3 blocks and archive
+`GATE3_EVIDENCE_ROOT` with the result. If either launch fails, generate a new run ID and
+rerun both modes; never append a retry to the old root. Dashboard streams are append-only,
+so reusing a directory would let counters from an earlier attempt masquerade as fresh
+eight-engine evidence.
 
 Then run the same boundary with the launcher's initial graph/concurrency defaults: memory
 fraction 0.70, graph batch 1, 32 running requests, and a 1024-token response. Save prompts,
@@ -459,17 +660,49 @@ python "${GLM_AMD_SCRIPT}" train \
   --hardware MI355X \
   --model-org zai-org --model-name GLM-5.2 \
   --num-nodes 8 --num-gpus-per-node 8 --num-rollout 1 \
+  --rollout-only \
+  --rollout-probe-capture \
+    "${GATE3_GRAPH_DETAILS}/rollout_data/{rollout_id}.pt" \
   --rollout-max-response-len 1024 \
-  --run-id glm52-amd-full-sglang-h8 \
+  --run-id "glm52-amd-full-sglang-h8-${GATE3_RUN_ID}" \
   --model-dir "${GLM_MODEL_DIR}" --model-local-dir "${GLM_LOCAL_DIR}" \
   --data-dir "${GLM_DATA_DIR}" --output-dir "${BRINGUP_ROOT}" \
-  --extra-args "--debug-rollout-only --debug-exit-after-rollout 1 \
-    --save-debug-rollout-data ${BRINGUP_ROOT}/full_sglang_h8/rollout_data/{rollout_id}.pt"
+  --extra-args "--debug-exit-after-rollout 1 --use-miles-dashboard \
+    --dump-details ${GATE3_GRAPH_DETAILS}"
 ```
 
-There is not yet a checked-in executable SGLang H8 prefill/decode parity test, so that
-comparison is a manual acceptance artifact. Do not let a green trainer-kernel unit test or
-mere engine liveness stand in for it.
+Prove that the eight-request workload reached all eight node-local engines in both modes;
+job success or a router aggregate alone is insufficient:
+
+```bash
+python - \
+  "${GATE3_EAGER_DETAILS}" \
+  "${GATE3_GRAPH_DETAILS}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+for details_arg in sys.argv[1:]:
+    details = Path(details_arg)
+    files = sorted((details / "dashboard" / "engine_series").glob("*.jsonl"))
+    requests_by_addr = {}
+    for path in files:
+        for line in path.read_text().splitlines():
+            record = json.loads(line)
+            if record["metric"] == "sglang_num_requests_total":
+                requests_by_addr[record["addr"]] = max(
+                    float(record["value"]), requests_by_addr.get(record["addr"], 0.0)
+                )
+    if len(requests_by_addr) != 8 or any(value <= 0 for value in requests_by_addr.values()):
+        raise SystemExit(f"{details}: expected 8 positive per-engine request counters, got {requests_by_addr}")
+    print(details, requests_by_addr)
+PY
+```
+
+The single-node driver checks eager/graph H8 parity for one 1x8 engine, but there is not yet
+a checked-in 8x8 eager/graph/actor-forward parity test. That cluster comparison remains a
+manual acceptance artifact. Do not let a green trainer-kernel unit test, one-node result,
+or mere engine liveness stand in for it.
 
 **Pass:** all eight engines load, compile TileLang NSA prefill/decode, capture only graph
 batch 1, and return valid samples; no engine restarts; eager/graph and actor-forward

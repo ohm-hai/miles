@@ -249,7 +249,9 @@ def execute_train(
     if (f := before_ray_job_submit) is not None:
         f()
 
-    no_proxy = _no_proxy_value(master_addr)
+    # Preserve the long-standing local-launch runtime environment so the
+    # external-Ray hardening does not perturb every standalone launcher.
+    no_proxy = _no_proxy_value(master_addr) if external_ray else f"127.0.0.1,{master_addr}"
     runtime_env_vars = {
         # exported for the submitting client too, but only the runtime env reaches the ray workers
         "PYTHONUNBUFFERED": "1",

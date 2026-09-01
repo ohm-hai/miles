@@ -84,7 +84,11 @@ Before reserving the full cluster, follow the
 [GLM-5.2 AMD bring-up runbook](glm5-2-amd-bringup.md). It separates the existing evidence
 from the still-unrun H8 GPU-kernel and SGLang checks, full-trainer, rollout, multi-node,
 weight-sync, and save/resume validation gates. MI350X and MI355X must each pass
-independently. The current engineering state and remaining work are recorded in the
+independently. Its
+[single-node qualification driver](../../../tests/e2e/megatron/model_scripts/test_glm5_2_amd_single_node_stages.py)
+is the executable H16 -> H8 -> full-checkpoint-load ladder for the first GPU window; the
+full 1x8 stage is rollout-path load/decode with lightweight trainer control ranks, not
+full-model training. The current engineering state and remaining work are recorded in the
 [AMD implementation handoff](glm5-2-amd-implementation-handoff.md).
 
 ### 4.3 Agentic RL: terminal-bench-2 in Daytona sandboxes (experimental)

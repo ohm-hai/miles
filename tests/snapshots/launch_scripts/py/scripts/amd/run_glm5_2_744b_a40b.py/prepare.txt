@@ -3,14 +3,25 @@ mkdir -p <SANDBOX>/models /root/datasets
 
 ### 1
 hf download Pinaster/GLM-5.2_5layer
+  --revision 1c749139f70e158e4420ba67f342bef1de2e650d
   --local-dir <SANDBOX>/models/GLM-5.2_5layer
 
 ### 2
 hf download
   --repo-type dataset zhuzilin/dapo-math-17k
+  --revision 2e65612930298bde4c5d58fd97b3f23a483aaff9
   --local-dir /root/datasets/dapo-math-17k
 
 ### 3
+python <REPO_ROOT>/tools/validate_grpo_dataset.py /root/datasets/dapo-math-17k/dapo-math-17k.jsonl
+  --profile dapo-math-17k
+  --tokenizer <SANDBOX>/models/GLM-5.2_5layer
+  --max-prompt-tokens 1024
+  --expected-min-prompt-tokens 73
+  --expected-max-prompt-tokens 1521
+  --expected-prompts-over-token-limit 7
+
+### 4
 PYTHONPATH=<REPO_ROOT>:/root/Megatron-LM:/frozen/pythonpath torchrun
   --nproc-per-node 1 <REPO_ROOT>/tools/convert_hf_to_torch_dist.py
   --spec miles_plugins.models.glm5.glm5 get_glm5_spec
@@ -49,7 +60,9 @@ PYTHONPATH=<REPO_ROOT>:/root/Megatron-LM:/frozen/pythonpath torchrun
   --kv-channels 192
   --qk-pos-emb-head-dim 64
   --vocab-size 154880
+  --rope-type rope
   --rotary-base 8000000
+  --rotary-scaling-factor 1
   --enable-experimental
   --hf-checkpoint <SANDBOX>/models/GLM-5.2_5layer
   --save <SANDBOX>/models/GLM-5.2_5layer_torch_dist

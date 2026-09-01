@@ -1,13 +1,14 @@
 import os
 
 _IS_ROCM = os.getenv("MILES_HARDWARE_PLATFORM") == "rocm"
+_amd_prepare_cp = None
 
 if _IS_ROCM:
     from scripts.amd.run_glm5_2_744b_a40b import (
         ScriptArgs,
         _convert_to_fp8,
         _execute_train,
-        _prepare_cp,
+        _prepare_cp as _amd_prepare_cp,
         _prepare_download,
         _prepare_megatron_ckpt,
         _validate_glm_checkpoint,
@@ -17,7 +18,6 @@ else:
         ScriptArgs,
         _convert_to_fp8,
         _execute_train,
-        _prepare_cp,
         _prepare_download,
         _prepare_megatron_ckpt,
         _validate_glm_checkpoint,
@@ -60,17 +60,22 @@ def _args() -> ScriptArgs:
     )
 
 
-def prepare(args: ScriptArgs):
+def prepare(args: ScriptArgs) -> None:
     U.exec_command_cpu(f"mkdir -p {args.output_dir}")
     _prepare_download(args)
     _validate_glm_checkpoint(args)
     if args.fp8_rollout:
         _convert_to_fp8(args)
     _prepare_megatron_ckpt(args)
-    _prepare_cp(args, skip_existing=True)
+    # The AMD launcher deliberately stages and validates a distinct node-local
+    # bundle. The NVIDIA five-layer recipe keeps ``model_local_dir`` equal to
+    # ``model_dir``; sending that no-op copy through ``rsync_simple`` would call
+    # ray.init(address="auto") before this single-node test has started Ray.
+    if _amd_prepare_cp is not None:
+        _amd_prepare_cp(args, skip_existing=True)
 
 
-def execute(args: ScriptArgs):
+def execute(args: ScriptArgs) -> None:
     _execute_train(args)
 
 

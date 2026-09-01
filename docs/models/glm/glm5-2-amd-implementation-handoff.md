@@ -17,17 +17,21 @@ capture, or end-to-end convergence.
 
 At this checkpoint:
 
-- repository: `radixark/miles`;
-- branch: `main`;
+- repository: `ohm-hai/miles`;
+- branch: `glm5.2-training`;
 - base commit: `542213b96264e818f2dca79356bf531aa1cea1f0`;
-- all changes are uncommitted in the shared worktree;
+- initial guarded implementation commit: `b62528bd158e9b20650c5c6818a89babf89403f1`;
+- the launcher hardening, staged qualification driver, dataset validator, refreshed snapshots,
+  and this handoff are committed together on the same branch;
 - the full AMD acceptance target is 8 nodes x 8 GPUs, separately qualified on MI350X and
   MI355X;
 - the detailed first-allocation procedure is in the
   [AMD bring-up runbook](glm5-2-amd-bringup.md).
 
-Do not discard or bulk-reset the worktree. It contains changes across the model path,
-launcher, kernels, validation infrastructure, image, tests, snapshots, and documentation.
+The branch contains changes across the model path, launcher, kernels, validation
+infrastructure, image, tests, snapshots, and documentation. Preserve both commits when
+rebasing or cherry-picking: the hardening commit depends on the initial implementation
+commit.
 
 ## What was learned from DeepSeek V4 Flash
 
@@ -156,10 +160,19 @@ The full initial topology is locked to:
 | PP stage starts | 1, 19, 39, 59 |
 | Local attention heads | H8 |
 
-The five-layer profile remains 1 node x 4 GPUs, TP4/PP1/CP1/EP4, which is the shape of
-the existing manual MI355X proof of concept. Its defaults keep R3 off and leave the router
-trainable. The full profile enables routing replay and freezes the router and e-score
-correction bias.
+The five-layer checkpoint has two deliberately separate qualification profiles:
+
+- `poc-h16`: 1 node x 4 GPUs, TP4/PP1/CP1/EP4, preserving the shape of the existing manual
+  MI355X proof of concept;
+- guarded `full-shape-h8`: 1 node x 8 GPUs, TP8/PP1/CP1/EP8, exercising the local H8 sparse
+  attention shape used by the full recipe without pretending that five layers prove the
+  744B model.
+
+The full checkpoint also has a guarded 1x8 rollout-only profile. It loads one TP8/EP8
+SGLang engine and skips Megatron parameters, optimizer, backward, save, and weight sync,
+while retaining lightweight control ranks and distributed/tokenizer setup. It is a
+checkpoint-load and NSA prefill/decode gate, not single-node full-model training. The full
+training profile enables routing replay and freezes the router and e-score correction bias.
 
 Conservative full-profile defaults are:
 
@@ -176,6 +189,25 @@ Conservative full-profile defaults are:
 FP8 rollout weights, Mori/DeepEP, MTP, indexer replay, and a trainable full-model router
 are behind `--allow-unvalidated-features`. FP8 refers only to SGLang rollout weights; the
 Megatron actor remains BF16.
+
+### Executable qualification ladder
+
+[`test_glm5_2_amd_single_node_stages.py`](../../../tests/e2e/megatron/model_scripts/test_glm5_2_amd_single_node_stages.py)
+is the executable first-allocation driver. It provides:
+
+- H16 and guarded H8 kernel -> prepare -> deterministic rollout capture -> trainer replay
+  -> two-cycle live GRPO stages;
+- strict capture freshness, sample status, finite log-probability/reward, and checkpoint
+  tracker assertions;
+- separate full-checkpoint eager and graph 1x8 rollout probes, followed by exact token-ID
+  parity and a declared BF16 log-probability tolerance of `0.03`;
+- exact visible GPU count and homogeneous MI350X/MI355X checks; and
+- fail-closed rejection of stale external-Ray configuration in the single-node shell.
+
+The 8x8 Gate 3 procedure uses eight deterministic requests with round-robin routing and a
+fresh per-invocation evidence directory. Acceptance requires eight distinct positive
+`sglang_num_requests_total` engine series in both eager and graph modes; historical
+append-only dashboard data cannot satisfy the gate.
 
 ## Correctness and reliability hardening completed
 
@@ -216,6 +248,16 @@ The launcher pins:
 - five-layer revision `1c749139f70e158e4420ba67f342bef1de2e650d`;
 - DAPO data revision `2e65612930298bde4c5d58fd97b3f23a483aaff9`.
 
+The DAPO revision is additionally bound to the 10,490,834-byte JSONL payload with
+SHA-256 `cc9c39c2aa19177abe9464741e121cf4cac90fd25484ef3cdf86535101e3a5b6`.
+[`validate_grpo_dataset.py`](../../../tools/validate_grpo_dataset.py) parses all 17,398
+rows and checks exact `{prompt, label}` chat/RM schema, prompt uniqueness, and the payload
+identity. The AMD launcher runs it after download and again on every Ray node before
+training, because the unpinned `RolloutManager` may load the dataset on any node. Its
+optional tokenizer pass proved that the pinned GLM-5.2 chat template renders prompts to
+73-1,521 tokens: every row fits the full profile's 4,096-token cap, while the five-layer
+1,024-token PoC intentionally filters seven rows.
+
 It validates the complete critical config and the audited index layouts:
 
 | Checkpoint | Weight entries | Shards | Metadata total size |
@@ -253,6 +295,19 @@ trusts a sentinel observed only on the head. HTTP proxy variables are removed fr
 driver, Ray submission, and worker runtime while validated node addresses are added to
 `NO_PROXY`. Existing external-Ray processes are not killed by generic launcher cleanup.
 
+The public `download` command stages and validates the pinned model and dataset before GPU
+reservation without requiring Ray or visible GPUs when `--hardware` is supplied explicitly.
+Conversely, full `prepare` and `full-train` perform the external-Ray and hardware preflight
+before downloading or converting roughly 1.5 TB. Single-node commands reject a stale
+`RAY_ADDRESS`, external-Ray mode, a non-loopback `MASTER_ADDR`, the wrong visible GPU count,
+or a mixed/wrong MI35x SKU.
+
+The launcher exposes only a strict arity-checked diagnostic `extra_args` allowlist. Topology,
+model, data, reward, and optimizer-policy overrides cannot bypass the guarded profiles.
+Rollout-only commands do not emit trainer rematerialization or disk-offload flags, reject
+trainer-offload options, and reject trainer replay input that would otherwise enable both
+debug modes in the core argument validator.
+
 ### Weight synchronization evidence
 
 Audit/CI modes on the default Ray path now query every allocated SGLang engine immediately
@@ -269,49 +324,44 @@ not overstate that boundary.
 
 ## Verification completed without GPUs
 
-The following focused results were green during implementation:
+The settled handoff tree passed:
 
-- AMD GLM launcher/artifact tests: 74 passed;
-- command utility tests: 79 passed;
-- default-Ray all-engine validation tests: 28 passed, 1 skipped;
-- Megatron RoPE return compatibility test: 1 passed;
-- GLM model-argument RoPE test and direct full/five-layer model snapshots: passed;
-- relevant Ruff checks, `py_compile`, and `git diff --check`: passed at their respective
-  checkpoints.
+- 166 focused AMD launcher, staged-wrapper, and dataset tests; one additional real Miles
+  parser regression was collected but skipped on the Mac because SGLang/router packages
+  are not installed there;
+- 79 command-utility tests, including local-launch compatibility and external-Ray proxy
+  isolation;
+- 24 no-update launcher snapshot tests covering the AMD, generic full-parameter, and LoRA
+  GLM-5.2 entrypoints; the AMD set includes the new `download` snapshot;
+- within that total, the staged single-node driver's 10 wrapper tests cover H16/H8 contracts,
+  clean-shell checks, capture freshness, and eager/graph parity;
+- a 12-function byte-for-byte mechanical-relocation audit for the launcher helper split;
+- relevant Ruff checks, `py_compile`, and `git diff --check`.
+
+The initial implementation commit separately passed the focused command utility,
+all-engine weight-version/checksum, RoPE compatibility, model-argument, and launcher
+infrastructure suites recorded in its development log. The final hardening did not alter
+the custom GPU kernel bodies from that commit.
 
 The manual H8/H16 and DeepSeek poison-memory suites were collected but cannot execute on
-this Mac without TileLang and a ROCm GPU.
-
-Snapshot regeneration was still in progress at the time of handoff. The manual launcher
-fixture has been updated to represent the five-layer checkpoint's exact 1,618-entry,
-14-shard index, but all affected launcher snapshots must be regenerated and reviewed after
-the final refactor. Adding the explicit RoPE flags also changes generic GLM-5.2 launcher
-snapshots, not only the AMD snapshots.
+this Mac without TileLang and a ROCm GPU. No item above is a substitute for running those
+suites in the frozen ROCm image.
 
 ## Remaining work before requesting GPUs
 
-Finish these in order:
+The code-side preparation is complete. The remaining work is operational:
 
-1. Complete or abandon cleanly the private-helper extraction that brings the AMD launcher
-   below the repository's approximate 1,000-line limit. Preserve launcher test access to
-   private validation helpers.
-2. Regenerate all affected model/launcher snapshots and inspect the command diffs. Expected
-   semantic additions are explicit RoPE flags and artifact validation commands; investigate
-   anything else.
-3. Run the complete launcher suites required by the repository rule:
-
-   ```bash
-   pytest tests/fast/launch_scripts tests/manual/launch_scripts
-   ```
-
-4. Run focused command-utils, all-engine validation, model-args, and RoPE compatibility
-   tests together, then run Ruff, `py_compile`, and `git diff --check` again.
-5. Review the five-layer E2E wrapper on both branches. AMD needs the new local checkpoint
-   copy; do not accidentally force the existing NVIDIA single-node path through a Ray copy
-   before a Ray cluster exists.
-6. Perform the final documentation consistency pass for the ROCm Docker sentinel and
-   `docs/ci/02-docker-build.md`.
-7. Read every changed snapshot and the final full worktree diff before committing.
+1. Build and freeze the exact ROCm image, record Miles/Megatron/SGLang/TileLang commits,
+   and run the image patch sentinel.
+2. Use `download` before the allocation, record the expensive source-transfer hashes, and
+   confirm shared storage, node-local NVMe, host RAM, and fabric capacity from the runbook.
+3. Run the single-node ladder on MI350X and MI355X independently. Stop at the first failed
+   H16/H8 kernel, rollout, replay, GRPO, or full-checkpoint eager/graph gate.
+4. Only after the single-node ladder passes, form the dedicated homogeneous 8x8 Ray cluster
+   and execute Gates 2-5 with fresh run-specific evidence directories.
+5. Preserve per-rank memory, throughput, RCCL, engine metrics, rollout captures, checksums,
+   checkpoints, and failure logs. Do not tune FP8, Mori/DeepEP, MTP, or concurrency until
+   the conservative BF16 path and save/resume gate pass.
 
 ## First GPU allocation
 
@@ -326,8 +376,8 @@ The gate order is:
    tests before loading the model.
 3. Run the H8 and H16 sparse-MLA GPU reference tests. Stop on any non-finite output,
    padded-head contamination, or gradient error above the declared tolerances.
-4. Re-establish the four-GPU five-layer BF16 boundary: trainer-only replay, SGLang-only,
-   then two-step E2E with checkpoint/save and weight-sync auditing.
+4. Re-establish the four-GPU five-layer BF16 boundary: trainer-only replay, rollout-only
+   control path, then two-step E2E with checkpoint/save and weight-sync auditing.
 5. Prepare and validate the pinned full BF16 artifacts on all eight nodes.
 6. Run one full trainer-only forward/backward/optimizer step with short sequences and no
    rollout engines. Record per-rank peak memory and first/steady-step time.
