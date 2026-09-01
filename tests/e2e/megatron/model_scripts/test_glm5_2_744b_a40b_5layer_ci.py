@@ -1,10 +1,13 @@
 import os
 
-if os.getenv("MILES_HARDWARE_PLATFORM") == "rocm":
+_IS_ROCM = os.getenv("MILES_HARDWARE_PLATFORM") == "rocm"
+
+if _IS_ROCM:
     from scripts.amd.run_glm5_2_744b_a40b import (
         ScriptArgs,
         _convert_to_fp8,
         _execute_train,
+        _prepare_cp,
         _prepare_download,
         _prepare_megatron_ckpt,
         _validate_glm_checkpoint,
@@ -14,6 +17,7 @@ else:
         ScriptArgs,
         _convert_to_fp8,
         _execute_train,
+        _prepare_cp,
         _prepare_download,
         _prepare_megatron_ckpt,
         _validate_glm_checkpoint,
@@ -46,7 +50,7 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 def _args() -> ScriptArgs:
     return ScriptArgs(
-        hardware="H200",
+        hardware="MI350X" if _IS_ROCM else "H200",
         model_name="GLM-5.2_5layer",
         num_nodes=1,
         num_gpus_per_node=4,
@@ -63,6 +67,7 @@ def prepare(args: ScriptArgs):
     if args.fp8_rollout:
         _convert_to_fp8(args)
     _prepare_megatron_ckpt(args)
+    _prepare_cp(args, skip_existing=True)
 
 
 def execute(args: ScriptArgs):

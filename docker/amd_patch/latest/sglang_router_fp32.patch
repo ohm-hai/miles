@@ -1,0 +1,42 @@
+diff --git a/python/sglang/srt/layers/rocm_linear_utils.py b/python/sglang/srt/layers/rocm_linear_utils.py
+--- a/python/sglang/srt/layers/rocm_linear_utils.py
++++ b/python/sglang/srt/layers/rocm_linear_utils.py
+@@ -10,8 +10,12 @@ def aiter_dsv3_router_gemm(
+     hidden_states: torch.Tensor,
+     weight: torch.Tensor,
+ ):
+-    """Use aiter tuned GEMM dispatcher (tgemm.mm) to automatically select the GEMM kernel."""
+-    return tgemm.mm(hidden_states, weight.detach(), otype=hidden_states.dtype)
++    """Use aiter tuned GEMM dispatcher (tgemm.mm) to automatically select the GEMM kernel.
++
++    Output is forced to fp32 for router-logit numerical stability, matching the
++    CUDA-side `dsv3_router_gemm`/`linear_bf16_fp32` paths; compute stays bf16.
++    """
++    return tgemm.mm(hidden_states, weight.detach(), otype=torch.float32)
+ 
+ 
+ def get_dsv3_gemm_output_zero_allocator_size(
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -476,16 +476,11 @@ class MoEGate(nn.Module):
+         )
+ 
+         if config.topk_method == "noaux_tc" and not is_hash_moe:
+-            correction_bias_dtype = torch.float32
+-            if quant_config is not None:
+-                if _use_aiter and quant_config.get_name() in (
+-                    "fp8",
+-                    "compressed_tensors",
+-                    "quark",
+-                ):
+-                    correction_bias_dtype = torch.bfloat16
++            # Always fp32: checkpoints store this in fp32, and every router-gemm
++            # branch (CUDA and aiter) now returns fp32 logits, so a bf16 copy here
++            # only loses precision without unblocking any downstream dtype match.
+             self.e_score_correction_bias = nn.Parameter(
+-                torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
++                torch.empty((config.n_routed_experts), dtype=torch.float32)
+             )
+         else:
+             self.e_score_correction_bias = None

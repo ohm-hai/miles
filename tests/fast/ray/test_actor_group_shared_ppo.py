@@ -101,3 +101,37 @@ async def test_train_only_ft_does_not_recover_rollout_engines():
 
     assert [name for name, _, _ in calls] == ["get_engines", "pause"]
     group._broadcast.assert_awaited_once_with("update_weights", info="info")
+
+
+async def test_default_update_path_runs_post_sync_all_engine_audit():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    from miles.ray.actor_group import RayTrainGroup
+
+    calls = []
+    group = object.__new__(RayTrainGroup)
+    group.args = SimpleNamespace(
+        debug_train_only=False,
+        debug_rollout_only=False,
+        use_fault_tolerance=False,
+        ft_components=[],
+    )
+    group.rollout_manager = SimpleNamespace(
+        get_updatable_engines_and_lock=_RemoteCall("get_engines", calls, result="info"),
+        health_monitoring_pause=_RemoteCall("pause", calls),
+    )
+    group._broadcast = AsyncMock()
+
+    with patch(
+        "miles.ray.actor_group.maybe_validate_and_log_inference_engine_weights",
+        new_callable=AsyncMock,
+    ) as audit:
+        await group.update_weights(rollout_id=4)
+
+    group._broadcast.assert_awaited_once_with("update_weights", info="info")
+    audit.assert_awaited_once_with(
+        args=group.args,
+        rollout_manager=group.rollout_manager,
+        rollout_id=4,
+    )

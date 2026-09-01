@@ -71,7 +71,23 @@ python scripts/run_glm5_2_744b_a40b.py train      --model-name GLM-5.2 --num-nod
 
 The recipe is tested on **H200 / B200 / GB300**; the `--hardware` flag accepts exactly these three values.
 
-### 4.2 Agentic RL: terminal-bench-2 in Daytona sandboxes (experimental)
+### 4.2 AMD MI350X / MI355X bring-up
+
+AMD uses a separate, deliberately guarded launcher:
+[`scripts/amd/run_glm5_2_744b_a40b.py`](../../../scripts/amd/run_glm5_2_744b_a40b.py).
+Its five-layer profile matches the open 4x MI355X manual proof of concept. Its full profile
+is a **provisional**, unvalidated 8-node x 8-GPU recipe for MI350X or MI355X using
+TP8 / PP4 / CP1 / DP2 / EP16 and pipeline layers `18,20,20,20`; accepting that shape in
+the launcher is not a support claim.
+
+Before reserving the full cluster, follow the
+[GLM-5.2 AMD bring-up runbook](glm5-2-amd-bringup.md). It separates the existing evidence
+from the still-unrun H8 GPU-kernel and SGLang checks, full-trainer, rollout, multi-node,
+weight-sync, and save/resume validation gates. MI350X and MI355X must each pass
+independently. The current engineering state and remaining work are recorded in the
+[AMD implementation handoff](glm5-2-amd-implementation-handoff.md).
+
+### 4.3 Agentic RL: terminal-bench-2 in Daytona sandboxes (experimental)
 
 Beyond the math recipe above, [`examples/experimental/openenv/glm52_tbench2/`](https://github.com/radixark/miles/tree/main/examples/experimental/openenv/glm52_tbench2) trains GLM-5.2 with fully-async agentic RL on terminal-bench-2: 16 GB300 nodes (4 GPUs each) split into 8 training nodes (TP2 / CP4 / PP4 / EP8, optimizer state streamed to node-local disk) and 8 inference nodes (one 4-GPU dp-attention FP8 SGLang engine per node). Every episode is a multi-turn terminal agent solving one terminal-bench-2 task inside its own Daytona cloud sandbox built from that task's official image; scoring is the task's canonical `tests/test.sh`.
 

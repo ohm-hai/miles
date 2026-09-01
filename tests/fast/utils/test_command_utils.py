@@ -18,7 +18,17 @@ from miles.utils.file_arg_utils import resolve_file_arg
 def commands(monkeypatch):
     recorded = record_commands(monkeypatch)
     monkeypatch.setattr(command_utils, "check_has_nvlink", lambda: False)
-    for name in ("MILES_SCRIPT_EXTERNAL_RAY", "RAY_ADDRESS", "NCCL_NVLS_ENABLE", "WANDB_API_KEY"):
+    cleared = (
+        "MILES_SCRIPT_EXTERNAL_RAY",
+        "RAY_ADDRESS",
+        "NCCL_NVLS_ENABLE",
+        "WANDB_API_KEY",
+        "NO_PROXY",
+        "no_proxy",
+        *command_utils._COLLECTIVE_TRANSPORT_ENV_VARS,
+        *command_utils._PROXY_ENV_VARS,
+    )
+    for name in cleared:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MILES_SCRIPT_ENABLE_RAY_SUBMIT", "1")
     monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
@@ -129,6 +139,18 @@ class TestConvertCheckpoint:
 
         assert "--master-addr" not in commands[0]
 
+    def test_can_keep_pipeline_parallel_size_one(self, commands, tmp_path):
+        """An EP-filled world may need the requested PP=1 instead of the converter's automatic PP split."""
+        command_utils.convert_checkpoint(
+            model_name="DeepSeek-V4-Flash-FP8",
+            megatron_model_type="deepseek-v4-flash",
+            num_gpus_per_node=8,
+            dir_dst=str(tmp_path),
+            keep_pipeline_parallel_size_one=True,
+        )
+
+        assert commands[0].startswith("CONVERT_KEEP_PP1=1 PYTHONPATH=")
+
 
 class TestRsyncSimple:
     def test_limits_itself_to_the_requested_node_count(self, monkeypatch):
@@ -153,6 +175,20 @@ class TestHfDownloadDataset:
         command_utils.hf_download_dataset("zhuzilin/dapo-math-17k", data_dir="/data")
 
         assert commands == ["hf download --repo-type dataset zhuzilin/dapo-math-17k --local-dir /data/dapo-math-17k"]
+
+    def test_can_pin_an_immutable_revision(self, commands):
+        revision = "2e65612930298bde4c5d58fd97b3f23a483aaff9"
+
+        command_utils.hf_download_dataset(
+            "zhuzilin/dapo-math-17k",
+            data_dir="/data",
+            revision=revision,
+        )
+
+        assert commands == [
+            "hf download --repo-type dataset zhuzilin/dapo-math-17k "
+            f"--revision {revision} --local-dir /data/dapo-math-17k"
+        ]
 
 
 class TestFp8CastBf16:
@@ -320,13 +356,16 @@ class TestExecuteTrain:
         assert "ray start --head --node-ip-address 127.0.0.1 --num-gpus 8 --disable-usage-stats" in commands[1]
 
     def test_leaves_an_external_ray_cluster_alone(self, commands, monkeypatch):
-        """With an external cluster we must neither stop nor start ray."""
+        """An external cluster may serve other jobs, so broad process cleanup is forbidden."""
         monkeypatch.setenv("MILES_SCRIPT_EXTERNAL_RAY", "1")
 
         command_utils.execute_train(train_args="", num_gpus_per_node=8, megatron_model_type="qwen3-4B")
 
-        assert not any("ray stop" in command or "ray start" in command for command in commands)
-        assert not any("pkill -9 ray" in command for command in commands)
+        assert len(commands) == 1
+        assert not any(
+            process in commands[0]
+            for process in ("ray stop", "ray start", "pkill -9 ray", "pkill -9 sglang", "pkill -9 miles", "pkill -9 redis")
+        )
 
     def test_runs_the_callback_before_submitting(self, commands):
         """before_ray_job_submit exists to prepare state the job will read."""
@@ -413,12 +452,18 @@ class TestExecuteTrain:
     def test_forwards_selected_nccl_variables_only_when_present(self, commands, monkeypatch):
         """Optional debug knobs are passed through, and absent ones must not appear as empty strings."""
         monkeypatch.setenv("NCCL_SOCKET_IFNAME", "eth0")
+        monkeypatch.setenv("NCCL_IB_HCA", "mlx5_0:1,mlx5_1:1")
+        monkeypatch.setenv("NCCL_DEBUG_SUBSYS", "INIT,NET")
+        monkeypatch.setenv("NCCL_IB_TIMEOUT", "23")
         monkeypatch.delenv("NCCL_DEBUG", raising=False)
 
         command_utils.execute_train(train_args="", num_gpus_per_node=8, megatron_model_type="qwen3-4B")
 
         runtime_env = _runtime_env(commands[-1])
         assert runtime_env["NCCL_SOCKET_IFNAME"] == "eth0"
+        assert runtime_env["NCCL_IB_HCA"] == "mlx5_0:1,mlx5_1:1"
+        assert runtime_env["NCCL_DEBUG_SUBSYS"] == "INIT,NET"
+        assert runtime_env["NCCL_IB_TIMEOUT"] == "23"
         assert "NCCL_DEBUG" not in runtime_env
 
     def test_bypasses_the_proxy_for_the_master_node(self, commands, monkeypatch):
@@ -430,6 +475,28 @@ class TestExecuteTrain:
         runtime_env = _runtime_env(commands[-1])
         assert runtime_env["no_proxy"] == "127.0.0.1,10.0.0.1"
         assert runtime_env["MASTER_ADDR"] == "10.0.0.1"
+
+    def test_external_ray_clears_http_proxies_in_submitter_and_workers(self, commands, monkeypatch):
+        """Ray control-plane and collectives traffic must never inherit an HTTP proxy."""
+        monkeypatch.setenv("MILES_SCRIPT_EXTERNAL_RAY", "1")
+        monkeypatch.setenv("RAY_ADDRESS", "http://10.0.0.1:8265")
+        monkeypatch.setenv("no_proxy", "10.0.0.2,10.0.0.3")
+        for name in command_utils._PROXY_ENV_VARS:
+            monkeypatch.setenv(name, "http://proxy.invalid:3128")
+
+        command_utils.execute_train(
+            train_args="",
+            num_gpus_per_node=8,
+            megatron_model_type="qwen3-4B",
+            extra_env_vars={"HTTP_PROXY": "http://extra.invalid:3128"},
+        )
+
+        assert all(name not in os.environ for name in command_utils._PROXY_ENV_VARS)
+        runtime_env = _runtime_env(commands[-1])
+        assert all(runtime_env[name] == "" for name in command_utils._PROXY_ENV_VARS)
+        assert runtime_env["NO_PROXY"] == runtime_env["no_proxy"]
+        assert "10.0.0.2" in runtime_env["no_proxy"]
+        assert commands[-1].startswith("unset HTTP_PROXY HTTPS_PROXY ALL_PROXY")
 
     def test_enables_cuda_core_dumps_on_request(self, commands):
         """The core dump knobs only appear when the config asks for them."""

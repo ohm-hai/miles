@@ -197,12 +197,14 @@ def _prepare_spmd(args: ScriptArgs):
     is_4layer = args.model_name == "DeepSeek-V4-Flash-FP8-4layer"
     actor_num_nodes = args.actor_num_nodes
     actor_num_gpus_per_node = args.actor_num_gpus_per_node
+    keep_pipeline_parallel_size_one = False
     extra_args = "--dsv4-impl miles --expert-tensor-parallel-size 1 --context-parallel-size 1 "
     if actor_num_nodes == 1 and is_4layer:
         extra_args += (
             "--tensor-model-parallel-size 1 " "--pipeline-model-parallel-size 1 " "--expert-model-parallel-size 1 "
         )
     elif actor_num_nodes == 1 and args.model_name == "DeepSeek-V4-Flash-FP8":
+        keep_pipeline_parallel_size_one = True
         extra_args += (
             "--tensor-model-parallel-size 1 " "--pipeline-model-parallel-size 1 " "--expert-model-parallel-size 8 "
         )
@@ -227,6 +229,7 @@ def _prepare_spmd(args: ScriptArgs):
         extra_args=extra_args,
         dir_dst=f"{args.model_dir}",
         megatron_path=args.megatron_path,
+        keep_pipeline_parallel_size_one=keep_pipeline_parallel_size_one,
     )
 
 

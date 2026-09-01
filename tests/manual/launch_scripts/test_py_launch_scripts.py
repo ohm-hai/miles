@@ -26,16 +26,75 @@ _SCRIPTS_IMPORTABLE_ONLY_UNDER_THE_NPU_PATCH = {"scripts/run_qwen3_4b_npu.py"}
 
 def _glm_checkpoint(sandbox: Path, model_name: str, num_layers: int) -> dict[str, object]:
     model_dir = sandbox / "models"
-    (model_dir / model_name).mkdir(parents=True)
-    (model_dir / model_name / "config.json").write_text(
+    checkpoint = model_dir / model_name
+    checkpoint.mkdir(parents=True)
+    indexer_types = [
+        "full" if layer <= 3 or (layer - 3) % 4 == 0 else "shared"
+        for layer in range(1, num_layers + 1)
+    ]
+    (checkpoint / "config.json").write_text(
         json.dumps(
             {
-                "model_type": "glm_moe_dsa",
                 "architectures": ["GlmMoeDsaForCausalLM"],
+                "dtype": "bfloat16",
+                "first_k_dense_replace": 3,
+                "head_dim": 192,
+                "hidden_size": 6144,
+                "index_head_dim": 128,
+                "index_n_heads": 32,
+                "index_skip_topk_offset": 3,
+                "index_topk": 2048,
+                "index_topk_freq": 4,
+                "indexer_rope_interleave": True,
+                "indexer_types": indexer_types,
+                "intermediate_size": 12288,
+                "kv_lora_rank": 512,
+                "mlp_layer_types": ["dense"] * 3 + ["sparse"] * (num_layers - 3),
+                "model_type": "glm_moe_dsa",
+                "moe_intermediate_size": 2048,
+                "n_routed_experts": 256,
+                "n_shared_experts": 1,
+                "num_attention_heads": 64,
+                "num_experts_per_tok": 8,
                 "num_hidden_layers": num_layers,
+                "num_nextn_predict_layers": 1,
+                "q_lora_rank": 2048,
+                "qk_head_dim": 256,
+                "qk_nope_head_dim": 192,
+                "qk_rope_head_dim": 64,
+                "rope_parameters": {"rope_theta": 8000000, "rope_type": "default"},
+                "routed_scaling_factor": 2.5,
+                "scoring_func": "sigmoid",
+                "topk_method": "noaux_tc",
+                "v_head_dim": 256,
+                "vocab_size": 154880,
             }
         )
     )
+    if model_name == "GLM-5.2_5layer":
+        num_weights = 1618
+        num_shards = 14
+        total_size = 45683868160
+    else:
+        num_weights = 1
+        num_shards = 1
+        total_size = None
+    shard_names = [
+        f"model-{index:05d}-of-{num_shards:05d}.safetensors"
+        for index in range(1, num_shards + 1)
+    ]
+    weight_map = {
+        f"fixture.weight.{index}": shard_names[index % num_shards]
+        for index in range(num_weights)
+    }
+    index = {"weight_map": weight_map}
+    if total_size is not None:
+        index["metadata"] = {"total_size": total_size}
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps(index)
+    )
+    for shard_name in shard_names:
+        (checkpoint / shard_name).write_bytes(b"fixture")
     return {"model_dir": str(model_dir)}
 
 
@@ -55,6 +114,9 @@ def _nemotron_checkpoint(sandbox: Path) -> dict[str, object]:
 
 
 _SCRIPTS_WHOSE_DEFAULTS_ARE_UNSUPPORTED: dict[str, Callable[[Path], dict[str, object]]] = {
+    "scripts/amd/run_glm5_2_744b_a40b.py": lambda sandbox: _glm_checkpoint(
+        sandbox, "GLM-5.2_5layer", 5
+    ),
     "scripts/run_deepseek_v4.py": lambda sandbox: {"model_name": "DeepSeek-V4-Flash-FP8-4layer"},
     "scripts/run_glm5_744b_a40b.py": lambda sandbox: _glm_checkpoint(sandbox, "GLM-5", 78),
     "scripts/run_glm5_2_744b_a40b.py": lambda sandbox: _glm_checkpoint(sandbox, "GLM-5.2", 78),
@@ -68,6 +130,7 @@ _SCRIPTS_WHOSE_DEFAULTS_ARE_UNSUPPORTED: dict[str, Callable[[Path], dict[str, ob
 # The machine each recording represents. Launchers default --hardware to whatever node they run on, so the
 # suite pins one; FROZEN_HARDWARE covers the rest.
 _HARDWARE_A_RECORDING_REPRESENTS = {
+    "scripts/amd/run_glm5_2_744b_a40b.py": "MI355X",
     "scripts/amd/run_qwen3_30b_a3b.py": "MI355X",
     "scripts/amd/run_qwen3_4b.py": "MI355X",
     "scripts/run_deepseek_v32.py": "B200",

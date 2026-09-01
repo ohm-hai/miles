@@ -112,6 +112,7 @@ def bwd(
         sm_scale = (D + D_tail) ** (-0.5)
     sm_scale_mul_reciprocal_log2 = sm_scale * 1.44269504  # log2(e)
 
+    total_heads = H
     H_kv = H // kv_group
     q_shape = [B, S, H, D + D_tail]
     k_shape = [B, S_kv, kv_group, D + D_tail]
@@ -152,6 +153,8 @@ def bwd(
             dO_shared = T.alloc_shared([block_H, D], dtype)
             mask = T.alloc_fragment([BS], "bool")
             kv_i = T.alloc_fragment([BS], indices_dtype)
+            valid_head = T.alloc_fragment([block_H], "bool")
+            head_i = T.alloc_fragment([block_H], indices_dtype)
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
             dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
@@ -172,6 +175,13 @@ def bwd(
             T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, :D], Q_shared)
             T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, D:], Q_tail_shared)
             T.copy(dO[by, s_i, bz * block_H : (bz + 1) * block_H, :D], dO_shared)
+            # H8 is padded to a 16-head tile. Tensor copies above are boundary
+            # aware, but the scalar LSE/Delta reads below are not. Clamp their
+            # address and explicitly zero padded lanes so they cannot inject a
+            # fake attention row into the shared dKV reduction.
+            for h_i in T.Parallel(block_H):
+                valid_head[h_i] = bz * block_H + h_i < total_heads
+                head_i[h_i] = T.min(bz * block_H + h_i, total_heads - 1)
 
             T.clear(acc_dq)
             T.clear(acc_dq_tail)
@@ -205,8 +215,13 @@ def bwd(
                 T.gemm(Q_tail_shared, KV_tail_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
 
                 for h_i, bi_i in T.Parallel(block_H, BS):
-                    acc_p[h_i, bi_i] = T.exp2(
-                        acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2 - Lse[by, s_i, bz * block_H + h_i]
+                    acc_p[h_i, bi_i] = T.if_then_else(
+                        valid_head[h_i],
+                        T.exp2(
+                            acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2
+                            - Lse[by, s_i, head_i[h_i]]
+                        ),
+                        0,
                     )
 
                 T.copy(acc_p, P_shared_cast)
@@ -216,8 +231,12 @@ def bwd(
                 )
 
                 for h_i, bi_i in T.Parallel(block_H, BS):
-                    acc_dp[h_i, bi_i] = (
-                        acc_p[h_i, bi_i] * (acc_dp[h_i, bi_i] - Delta[by, s_i, bz * block_H + h_i]) * sm_scale
+                    acc_dp[h_i, bi_i] = T.if_then_else(
+                        valid_head[h_i],
+                        acc_p[h_i, bi_i]
+                        * (acc_dp[h_i, bi_i] - Delta[by, s_i, head_i[h_i]])
+                        * sm_scale,
+                        0,
                     )
 
                 T.copy(acc_dp, dP_shared_cast)

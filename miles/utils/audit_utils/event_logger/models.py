@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import Discriminator
+from pydantic import Discriminator, Field
 
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome
 from miles.utils.audit_utils.process_identity import ProcessIdentity
@@ -74,6 +74,11 @@ class InferenceEngineWeightChecksumEvent(EventBase):
     type: Literal["inference_engine_weight_checksum"] = "inference_engine_weight_checksum"
     # None for the initial out-of-loop weight sync (not tied to a rollout).
     rollout_id: int | None
+    # The rollout manager's version after the trainer-to-engine sync and the
+    # version reported by every logical rollout engine, in engine order.
+    # Defaults keep events written before version auditing backward compatible.
+    expected_weight_version: str | None = None
+    engine_weight_versions: list[str] = Field(default_factory=list)
     # One {tensor -> hash} dict per rollout engine; a TP>1 engine's ranks merge with a rank{r}/ prefix.
     engine_checksums: list[dict[str, str]]
 

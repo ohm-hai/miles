@@ -8,6 +8,7 @@ import asyncio
 from ray.util.placement_group import PlacementGroup
 
 from miles.ray.train.actor_factory import allocate_gpus_for_actor
+from miles.utils.audit_utils.inference_engine_validation import maybe_validate_and_log_inference_engine_weights
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
 
 
@@ -128,6 +129,11 @@ class RayTrainGroup:
         await self.rollout_manager.health_monitoring_pause.remote()
 
         await self._broadcast("update_weights", info=info)
+        await maybe_validate_and_log_inference_engine_weights(
+            args=self.args,
+            rollout_manager=self.rollout_manager,
+            rollout_id=rollout_id,
+        )
 
     async def reconcile_adapters(self) -> None:
         """Multi-LoRA: reconcile loaded adapters with the controller's active set

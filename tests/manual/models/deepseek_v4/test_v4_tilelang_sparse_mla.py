@@ -360,23 +360,48 @@ def test_sparse_mla_backward(batch, seqlen, heads, dim, seqlen_kv, topk):
 @requires_cuda()
 @requires_tilelang()
 def test_partial_invalid_indices():
-    """Test with some indices set to -1 (invalid)."""
-    batch, seqlen, heads, dim, seqlen_kv, topk = 1, 256, 8, 512, 320, 128
-    q, kv, attn_sink, topk_idxs = make_inputs(batch, seqlen, heads, dim, seqlen_kv, topk)
+    """Padded -1 slots must neither read before KV nor write before dKV."""
+    batch, seqlen, heads, dim, seqlen_kv, topk = 1, 256, 8, 512, 320, 70
+    q, kv_valid, attn_sink, topk_idxs = make_inputs(batch, seqlen, heads, dim, seqlen_kv, topk)
     sm_scale = (1.0 / dim) ** 0.5
 
-    # Set last 25% of indices to -1
+    # Keep an infinity immediately before the contiguous KV view. An unsafe -1
+    # gather deterministically poisons the masked GEMM instead of depending on
+    # whatever allocation happens to precede KV.
+    kv_storage = torch.empty(batch, seqlen_kv + 1, dim, device="cuda", dtype=torch.bfloat16)
+    kv_storage[:, 0].fill_(float("inf"))
+    kv_storage[:, 1:].copy_(kv_valid)
+    kv = kv_storage[:, 1:]
+    assert kv.is_contiguous()
+
+    # Set the last 25% of caller-provided indices to -1. topk=70 also makes
+    # both interfaces append their own -1 padding to their block-size multiple.
     topk_idxs[:, :, topk * 3 // 4 :] = -1
 
-    ref_o = ref_dense_attn(q, kv, attn_sink, topk_idxs, sm_scale)
-    tl_o, _ = sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale)
+    ref_o, ref_dq, ref_dkv, ref_d_sink = ref_dense_attn_with_grad(q, kv, attn_sink, topk_idxs, sm_scale)
+    q_tl = q.clone().requires_grad_(True)
+    kv_tl = kv.detach().requires_grad_(True)
+    sink_tl = attn_sink.clone().requires_grad_(True)
+    tl_o = sparse_attn_tilelang(q_tl, kv_tl, sink_tl, topk_idxs, sm_scale)
+    tl_o.float().sum().backward()
 
     diff = compute_diff(ref_o.float(), tl_o.float())
     print("\n[PARTIAL-INVALID]")
     print_diff("output", diff)
 
     assert diff.rel_diff < 1e-3, f"rel_diff too large with partial invalid: {diff.rel_diff:.2e}"
-    assert not torch.isnan(tl_o).any(), "NaN in output with partial invalid indices"
+    assert torch.isfinite(tl_o).all(), "Non-finite output with partial invalid indices"
+
+    for name, ref_g, tl_g in [
+        ("dQ", ref_dq, q_tl.grad),
+        ("dKV", ref_dkv, kv_tl.grad),
+        ("dAttnSink", ref_d_sink, sink_tl.grad),
+    ]:
+        assert tl_g is not None
+        assert torch.isfinite(tl_g).all(), f"Non-finite {name} with partial invalid indices"
+        grad_diff = compute_diff(ref_g.float(), tl_g.float())
+        print_diff(name, grad_diff)
+        assert grad_diff.rel_diff < 0.05, f"{name} rel_diff too large: {grad_diff.rel_diff:.2e}"
 
 
 # ---------------------------------------------------------------------------

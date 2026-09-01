@@ -31,7 +31,7 @@ The Dockerfile is the build recipe: it provides the cu13 defaults and emits one 
 
 **Output** — one `radixark/miles` image for the platform buildx targets: the SGLang base, then the Python dependencies declared in `requirements.txt`, Megatron-LM at its branch default or caller-pinned commit, Miles, and the prebuilt wheels (`sgl-router` among them). A multi-arch build is one `buildx` run executed once per platform — `TARGETARCH` differs each time, so each arch installs its own wheels — and buildx pushes the two as a single manifest.
 
-`docker/Dockerfile.rocm` is the ROCm counterpart (build-args `GPU_ARCH` + a ROCm `SGLANG_IMAGE_TAG`; the 7.2 variants also set `APPLY_ROCR_VMMFIX=1`, which downloads the ROCr VMM-pause fix `.so` from the `WHEELS_TAG_ROCM` release and installs it — ROCm 7.0 has no such regression and leaves it off).
+`docker/Dockerfile.rocm` is the ROCm counterpart (build-args `GPU_ARCH` + a ROCm `SGLANG_IMAGE_TAG`; the 7.2 variants also set `APPLY_ROCR_VMMFIX=1`, which downloads the ROCr VMM-pause fix `.so` from the `WHEELS_TAG_ROCM` release and installs it — ROCm 7.0 has no such regression and leaves it off). The ROCm image applies the temporary `sglang_router_fp32.patch`, or verifies that this exact patch is already present, so AITER keeps MoE router logits and the checkpoint's expert-correction bias in FP32; remove the patch after pinning an upstream SGLang revision that contains the fix.
 
 ## Build script
 

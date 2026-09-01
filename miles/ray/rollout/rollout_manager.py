@@ -48,6 +48,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 logger = logging.getLogger(__name__)
+_ENGINE_VERSION_AUDIT_TIMEOUT_SECONDS = 120
 
 
 @ray.remote
@@ -382,6 +383,26 @@ class RolloutManager:
         return await srv.check_weights(
             action=action, allow_quant_error=allow_quant_error, selector=selector, skip_list=skip_list
         )
+
+    async def get_updatable_engine_weight_versions(self) -> tuple[int | None, list[int | str | None]]:
+        """Return the controller version and every logical updatable engine's version."""
+        srv = self._get_updatable_server()
+        if srv is None:
+            return self.weight_version, []
+
+        engines = srv.engines
+        if not engines or not all(engine.is_allocated for engine in engines):
+            raise RuntimeError("Cannot audit weight versions without every rollout engine allocated")
+        try:
+            engine_versions = await asyncio.wait_for(
+                asyncio.gather(*[engine.actor_handle.get_weight_version.remote() for engine in engines]),
+                timeout=_ENGINE_VERSION_AUDIT_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as error:
+            raise RuntimeError(
+                "Timed out while auditing the weight version of every rollout engine after an update"
+            ) from error
+        return self.weight_version, engine_versions
 
     def set_weight_version(self, weight_version: int):
         # warning instead of assert when use indep_dp ft

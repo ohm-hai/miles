@@ -148,6 +148,7 @@ def bwd(
             KV_shared = T.alloc_shared([BS, D], dtype)
             dO_shared = T.alloc_shared([block_H, D], dtype)
             mask = T.alloc_fragment([BS], "bool")
+            kv_i = T.alloc_fragment([BS], indices_dtype)
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
             dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
@@ -167,12 +168,17 @@ def bwd(
             for i_i in T.Pipelined(NS, num_stages=num_stages):
                 for bi_i in T.Parallel(BS):
                     mask[bi_i] = Indices[by, s_i, i_i * BS + bi_i] != -1
+                # A padded -1 would read before KV and can make the nominally
+                # zero dP column NaN through 0 * inf. Use an in-range gather and
+                # a true zero key for every padded slot.
+                for bi_i in T.Parallel(BS):
+                    kv_i[bi_i] = T.max(Indices[by, s_i, i_i * BS + bi_i], 0)
 
                 for h_i, bi_i in T.Parallel(block_H, BS):
                     acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_p.dtype))
 
                 for bi_i, d_i in T.Parallel(BS, D):
-                    KV_shared[bi_i, d_i] = KV[by, Indices[by, s_i, i_i * BS + bi_i], d_i]
+                    KV_shared[bi_i, d_i] = T.if_then_else(mask[bi_i], KV[by, kv_i[bi_i], d_i], 0)
 
                 T.gemm(Q_shared, KV_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
 
@@ -216,13 +222,12 @@ def bwd(
                         if bi_i < BS // split_store:
                             acc_dkv_shared[bi_i, d_i] = acc_dkv[bi_i + s * (BS // split_store), d_i]
 
+                    # Padded columns contribute exact zeros, so clamping their
+                    # atomic destination to index 0 is a safe no-op instead of an
+                    # out-of-bounds write before dKV.
                     for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
                         T.atomic_addx4(
-                            dKV[
-                                by,
-                                Indices[by, s_i, i_i * BS + bi_i + s * (BS // split_store)],
-                                d_i * 4,
-                            ],
+                            dKV[by, kv_i[bi_i + s * (BS // split_store)], d_i * 4],
                             acc_dkv_shared[bi_i, d_i * 4],
                         )
 

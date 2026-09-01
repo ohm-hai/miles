@@ -54,6 +54,15 @@ def source_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq: in
     return layer
 
 
+def _extract_rotary_pos_emb(
+    rotary_result: torch.Tensor | tuple[torch.Tensor, float],
+) -> torch.Tensor:
+    """Handle both current and legacy Megatron rotary-embedding return values."""
+    if isinstance(rotary_result, tuple):
+        return rotary_result[0]
+    return rotary_result
+
+
 @dataclass
 class DSASelfAttentionSubmodules:
     """Submodules for the MLA self-attention layer."""
@@ -539,7 +548,8 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
             inference_context, None, hidden_states, self.config, packed_seq_params
         )
         # TODO: support apply_rope_fusion
-        rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq_params is not None)
+        rotary_result = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq_params is not None)
+        rotary_pos_emb = _extract_rotary_pos_emb(rotary_result)
 
         cu_seqlens_q = packed_seq_params.cu_seqlens_q
         cu_seqlens_kv = packed_seq_params.cu_seqlens_kv

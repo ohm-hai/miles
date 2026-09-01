@@ -27,6 +27,40 @@ _ = exec_command_cpu, exec_command_gpu, exec_command_multi_node, dataclass_cli
 
 repo_base_dir = Path(os.path.abspath(__file__)).resolve().parents[3]
 
+_COLLECTIVE_TRANSPORT_ENV_VARS = (
+    "GLOO_SOCKET_IFNAME",
+    "NCCL_DEBUG",
+    "NCCL_DEBUG_FILE",
+    "NCCL_DEBUG_SUBSYS",
+    "NCCL_IB_ADDR_FAMILY",
+    "NCCL_IB_DISABLE",
+    "NCCL_IB_GID_INDEX",
+    "NCCL_IB_HCA",
+    "NCCL_IB_PCI_RELAXED_ORDERING",
+    "NCCL_IB_QPS_PER_CONNECTION",
+    "NCCL_IB_RETRY_CNT",
+    "NCCL_IB_SPLIT_DATA_ON_QPS",
+    "NCCL_IB_TC",
+    "NCCL_IB_TIMEOUT",
+    "NCCL_NET",
+    "NCCL_NET_GDR_LEVEL",
+    "NCCL_SOCKET_FAMILY",
+    "NCCL_SOCKET_IFNAME",
+)
+_PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+
+
+def _no_proxy_value(master_addr: str) -> str:
+    configured = os.environ.get("no_proxy", "") + "," + os.environ.get("NO_PROXY", "")
+    entries = ["127.0.0.1", master_addr]
+    entries.extend(entry.strip() for entry in configured.split(",") if entry.strip())
+    return ",".join(dict.fromkeys(entries))
+
+
+def _clear_proxy_env() -> None:
+    for name in _PROXY_ENV_VARS:
+        os.environ.pop(name, None)
+
 
 def _pythonpath_with_sources(megatron_path: str, *additional_pythonpaths: str | None) -> str:
     entries = [str(repo_base_dir), megatron_path]
@@ -46,6 +80,7 @@ def convert_checkpoint(
     dir_dst: str = "/root",
     hf_checkpoint: str | None = None,
     megatron_path: str = "/root/Megatron-LM",
+    keep_pipeline_parallel_size_one: bool = False,
 ):
     hf_checkpoint = hf_checkpoint or f"/root/models/{model_name}"
 
@@ -71,8 +106,9 @@ def convert_checkpoint(
         else:
             fn = exec_command_gpu
         pythonpath = shlex.quote(_pythonpath_with_sources(megatron_path))
+        keep_pp1_env = "CONVERT_KEEP_PP1=1 " if keep_pipeline_parallel_size_one else ""
         fn(
-            f"PYTHONPATH={pythonpath} "
+            f"{keep_pp1_env}PYTHONPATH={pythonpath} "
             f"torchrun "
             f"--nproc-per-node {num_gpus_per_node} "
             f"{multinode_args}"
@@ -115,9 +151,12 @@ def ssh_start_ray_workers(
     )
 
 
-def hf_download_dataset(full_name: str, data_dir: str = "/root/datasets"):
+def hf_download_dataset(full_name: str, data_dir: str = "/root/datasets", revision: str | None = None):
     _, partial_name = full_name.split("/")
-    exec_command_cpu(f"hf download --repo-type dataset {full_name} --local-dir {data_dir}/{partial_name}")
+    revision_arg = f" --revision {shlex.quote(revision)}" if revision else ""
+    exec_command_cpu(
+        f"hf download --repo-type dataset {full_name}{revision_arg} --local-dir {data_dir}/{partial_name}"
+    )
 
 
 @contextmanager
@@ -178,28 +217,29 @@ def execute_train(
         train_script = f"{repo_base_dir}/{train_script}"
     external_ray = get_bool_env_var("MILES_SCRIPT_EXTERNAL_RAY")
     master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+    if external_ray:
+        _clear_proxy_env()
 
     train_backend_fsdp = "--train-backend fsdp" in train_args
     assert train_backend_fsdp == (megatron_model_type is None)
 
-    exec_command_cpu(
-        "pkill -9 sglang; "
-        "sleep 3; "
-        f"{'' if external_ray else 'ray stop --force; '}"
-        f"{'' if external_ray else 'pkill -9 ray; '}"
-        # cannot be run in CI, o/w kill the parent script
-        # TODO: do we really need this kill? (or can we instead kill miles)
-        # "pkill -9 python; "
-        "pkill -9 miles; "
-        "sleep 3; "
-        f"{'' if external_ray else 'pkill -9 ray; '}"
-        # "pkill -9 python; "
-        "pkill -9 miles; "
-        "pkill -9 redis; "
-        "true; "
-    )
-
     if not external_ray:
+        exec_command_cpu(
+            "pkill -9 sglang; "
+            "sleep 3; "
+            "ray stop --force; "
+            "pkill -9 ray; "
+            # cannot be run in CI, o/w kill the parent script
+            # TODO: do we really need this kill? (or can we instead kill miles)
+            # "pkill -9 python; "
+            "pkill -9 miles; "
+            "sleep 3; "
+            "pkill -9 ray; "
+            # "pkill -9 python; "
+            "pkill -9 miles; "
+            "pkill -9 redis; "
+            "true; "
+        )
         exec_command_cpu(
             # will prevent ray from buffering stdout/stderr
             f"export PYTHONUNBUFFERED=1 && "
@@ -209,6 +249,7 @@ def execute_train(
     if (f := before_ray_job_submit) is not None:
         f()
 
+    no_proxy = _no_proxy_value(master_addr)
     runtime_env_vars = {
         # exported for the submitting client too, but only the runtime env reaches the ray workers
         "PYTHONUNBUFFERED": "1",
@@ -222,12 +263,8 @@ def execute_train(
         ),
         # a get() default is evaluated eagerly, which would probe even when already decided
         "NCCL_NVLS_ENABLE": os.environ.get("NCCL_NVLS_ENABLE") or str(int(check_has_nvlink())),
-        **{
-            k: os.environ[k]
-            for k in ("NCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME", "NCCL_DEBUG", "NCCL_DEBUG_FILE")
-            if k in os.environ
-        },
-        "no_proxy": f"127.0.0.1,{master_addr}",
+        **{name: os.environ[name] for name in _COLLECTIVE_TRANSPORT_ENV_VARS if name in os.environ},
+        "no_proxy": no_proxy,
         # This is needed by megatron / torch distributed in multi-node setup
         "MASTER_ADDR": master_addr,
         **(
@@ -242,13 +279,26 @@ def execute_train(
         ),
         **resolve_extra_env_vars(extra_env_vars, config),
     }
+    if external_ray:
+        # Safety-critical network isolation wins over arbitrary launcher/config
+        # extras: an HTTP proxy can make Ray or RCCL silently leave the fabric.
+        runtime_env_vars.update({name: "" for name in _PROXY_ENV_VARS})
+        runtime_env_vars["no_proxy"] = no_proxy
+        runtime_env_vars["NO_PROXY"] = no_proxy
     runtime_env_vars["PYTHONPATH"] = _pythonpath_with_sources(megatron_path, runtime_env_vars.get("PYTHONPATH"))
     runtime_env_json = json.dumps({"env_vars": runtime_env_vars})
 
     if get_bool_env_var("MILES_SCRIPT_ENABLE_RAY_SUBMIT", "1"):
         model_args = shell_safe_model_args(megatron_model_type)
+        proxy_preamble = "export no_proxy=127.0.0.1 && "
+        if external_ray:
+            proxy_names = " ".join(_PROXY_ENV_VARS)
+            no_proxy = shlex.quote(runtime_env_vars["no_proxy"])
+            proxy_preamble = (
+                f"unset {proxy_names}; export no_proxy={no_proxy}; export NO_PROXY={no_proxy}; "
+            )
         exec_command_cpu(
-            f"export no_proxy=127.0.0.1 && export PYTHONUNBUFFERED=1 && "
+            f"{proxy_preamble}export PYTHONUNBUFFERED=1 && "
             f"""ray job submit {'' if 'RAY_ADDRESS' in os.environ else '--address="http://127.0.0.1:8265" '}"""
             f"--runtime-env-json={shlex.quote(runtime_env_json)} "
             f"-- python3 {train_script} "

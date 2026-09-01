@@ -1,5 +1,5 @@
 ### 0
-PYTHONPATH=<REPO_ROOT>:/root/Megatron-LM:/frozen/pythonpath torchrun
+CONVERT_KEEP_PP1=1 PYTHONPATH=<REPO_ROOT>:/root/Megatron-LM:/frozen/pythonpath torchrun
   --nproc-per-node 8 <REPO_ROOT>/tools/convert_hf_to_torch_dist.py
   --disable-bias-linear
   --num-layers 43

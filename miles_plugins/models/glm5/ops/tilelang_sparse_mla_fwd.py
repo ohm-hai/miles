@@ -3,6 +3,7 @@
 import os
 
 import tilelang
+import torch
 from tilelang import language as T
 
 
@@ -70,7 +71,8 @@ def sparse_mla_fwd(
         REPLICATE_H = 1
 
     H_per_block = padded_H if REPLICATE_H == 1 else 64
-    kernel_num_stages = min(num_stages, 1) if os.getenv("MILES_HARDWARE_PLATFORM") == "rocm" else num_stages
+    is_rocm = getattr(torch.version, "hip", None) is not None or os.getenv("MILES_HARDWARE_PLATFORM") == "rocm"
+    kernel_num_stages = min(num_stages, 1) if is_rocm else num_stages
 
     @T.prim_func
     def main(

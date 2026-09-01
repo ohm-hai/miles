@@ -151,12 +151,29 @@ class TestInferenceEngineWeightChecksumEvent:
             timestamp=_FIXED_TS,
             source=_FIXED_SOURCE,
             rollout_id=4,
+            expected_weight_version="4",
+            engine_weight_versions=["4", "4"],
             engine_checksums=engine_checksums,
         )
         parsed = _event_adapter.validate_json(event.model_dump_json())
         assert isinstance(parsed, InferenceEngineWeightChecksumEvent)
         assert parsed.rollout_id == 4
+        assert parsed.expected_weight_version == "4"
+        assert parsed.engine_weight_versions == ["4", "4"]
         assert parsed.engine_checksums == engine_checksums
+
+    def test_pre_version_audit_event_defaults_remain_parseable(self) -> None:
+        """Events written before version auditing still parse with empty version metadata."""
+        event = InferenceEngineWeightChecksumEvent.model_validate(
+            {
+                "timestamp": _FIXED_TS,
+                "source": _FIXED_SOURCE,
+                "rollout_id": 3,
+                "engine_checksums": [{"rank0/w": "aaa"}],
+            }
+        )
+        assert event.expected_weight_version is None
+        assert event.engine_weight_versions == []
 
 
 class TestWitnessSnapshotParamEventWithStaleIds:
